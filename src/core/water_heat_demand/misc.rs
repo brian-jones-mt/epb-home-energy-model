@@ -2,7 +2,6 @@ use crate::core::material_properties::WATER;
 use crate::core::schedule::WaterScheduleEventType;
 use crate::hem_core::simulation_time::SimulationTimeIteration;
 use anyhow::bail;
-use format_num::format_num;
 use fsum::FSum;
 use itertools::Itertools;
 use smartstring::alias::String;
@@ -44,11 +43,12 @@ impl From<WaterScheduleEventType> for WaterEventResultType {
 
 #[derive(Clone, Copy, Debug)]
 /// Result of processing a single water use event
-pub(crate) struct WaterEventResult {
+pub struct WaterEventResult {
     pub(crate) event_result_type: WaterEventResultType,
     pub(crate) temperature_warm: f64, // Temperature of water at outlet (Celsius)
     pub(crate) volume_warm: f64,      // Volume of water at outlet (litres)
     pub(crate) volume_hot: f64,       // Hot water demand volume (litres)
+    pub(crate) event_duration: f64,   // Duration of hot water event (minutes)
 }
 
 impl WaterEventResult {
@@ -58,11 +58,27 @@ impl WaterEventResult {
         let temperature = self.temperature_warm;
         let abbrev = self.event_result_type.abbreviation();
 
+        // equivalent of Python's formatting to 10 significant figures
+        let format_number = |num: f64| -> String {
+            if num == 0.0 {
+                return "0".into();
+            }
+            // 10 total digits minus the digits left of the decimal point
+            let precision = (10 - (num.abs().log10().floor() as i32 + 1)).max(0) as usize;
+            // set decimal precision dynamically
+            let mut s = format!("{:.1$}", num, precision);
+            if s.contains('.') {
+                s = s.trim_end_matches('0').trim_end_matches('.').into();
+            }
+
+            s.into()
+        };
+
         format!(
             "{abbrev}: {} ({} @ {})",
-            format_num!(".10g", hot_volume),
-            format_num!(".10g", warm_volume),
-            format_num!(".10g", temperature)
+            format_number(hot_volume),
+            format_number(warm_volume),
+            format_number(temperature)
         )
         .into()
     }
@@ -78,7 +94,7 @@ pub(crate) fn summarise_events(events: &[WaterEventResult]) -> String {
 
 #[derive(Debug, thiserror::Error)]
 #[error("Cannot achieve temperature {temperature_target} by mixing water at {temperature_cold} and {temperature_hot}")]
-pub(crate) struct UnachievableTemperatureByMixingError {
+pub struct UnachievableTemperatureByMixingError {
     temperature_target: f64,
     temperature_hot: f64,
     temperature_cold: f64,
@@ -91,14 +107,14 @@ pub(crate) struct UnachievableTemperatureByMixingError {
 /// * `temp_target` -- temperature to be achieved, in any units
 /// * `temp_hot`    -- temperature of hot water to be mixed, in same units as temp_target
 /// * `temp_cold`   -- temperature of cold water to be mixed, in same units as temp_target
-pub(crate) fn calc_fraction_hot_water(
+pub fn calc_fraction_hot_water(
     temperature_target: f64,
     temperature_hot: f64,
     temperature_cold: f64,
 ) -> Result<f64, UnachievableTemperatureByMixingError> {
     let fraction = (temperature_target - temperature_cold) / (temperature_hot - temperature_cold);
-    if (fraction < 0.0 && !is_close!(fraction, 0.0, abs_tol = 1e-10))
-        || (fraction > 1.0 && !is_close!(fraction, 1.0, abs_tol = 1e-10))
+    if (fraction < 0.0 && !is_close!(fraction, 0.0, abs_tol = 1e-10, rel_tol = 1e-9))
+        || (fraction > 1.0 && !is_close!(fraction, 1.0, abs_tol = 1e-10, rel_tol = 1e-9))
     {
         return Err(UnachievableTemperatureByMixingError {
             temperature_target,
@@ -138,16 +154,19 @@ pub(crate) fn volume_hot_water_required<
     let mut temperature_hot_water = func_temperature_hot_water(volume_warm_water * 0.5)?;
     let mut list_temperature_volume =
         func_temperature_cold_water(volume_warm_water * 0.5, simtime)?;
-    let mut temperature_cold_water = list_temperature_volume
-        .iter()
-        .map(|(t, v)| t * v)
-        .sum::<f64>()
-        / list_temperature_volume.iter().map(|(_, v)| v).sum::<f64>();
+    let mut temperature_cold_water =
+        FSum::with_all(list_temperature_volume.iter().map(|(t, v)| t * v)).value()
+            / FSum::with_all(list_temperature_volume.iter().map(|(_, v)| v)).value();
     let mut temperature_warm_water = temperature_hot_water;
     let mut volume_hot_water: f64 = Default::default();
     let mut was_in_loop = false;
 
-    while !is_close!(temperature_warm_water, temperature_target, abs_tol = 1e-10) {
+    while !is_close!(
+        temperature_warm_water,
+        temperature_target,
+        abs_tol = 1e-10,
+        rel_tol = 1e-9
+    ) {
         was_in_loop = true;
         // Calculate the volume of hot/cold water needed if heating from cold water source
         if temperature_target > temperature_hot_water {
@@ -166,11 +185,9 @@ pub(crate) fn volume_hot_water_required<
             &mut list_temperature_volume,
             func_temperature_cold_water(volume_cold_water, simtime)?,
         );
-        temperature_cold_water = list_temperature_volume
-            .iter()
-            .map(|(t, v)| t * v)
-            .sum::<f64>()
-            / list_temperature_volume.iter().map(|(_, v)| v).sum::<f64>();
+        temperature_cold_water = FSum::with_all(list_temperature_volume.iter().map(|(t, v)| t * v))
+            .value()
+            / FSum::with_all(list_temperature_volume.iter().map(|(_, v)| v)).value();
         temperature_warm_water = (volume_hot_water * temperature_hot_water
             + volume_cold_water * temperature_cold_water)
             / volume_warm_water;
@@ -214,7 +231,7 @@ pub(crate) fn calculate_volume_weighted_average_temperature(
     let weighted_temp_sum = FSum::with_all(&temp_volume_products).value();
     let total_volume = FSum::with_all(&volumes).value();
 
-    if total_volume == 0. {
+    if is_close!(total_volume, 0., abs_tol = 1e-10, rel_tol = 1e-9) {
         bail!("Cannot calculate weighted average: total volume is zero");
     }
 

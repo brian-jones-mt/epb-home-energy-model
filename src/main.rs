@@ -2,7 +2,8 @@ use clap::{Args, Parser};
 
 use home_energy_model::output_writer::FileOutputWriter;
 use home_energy_model::read_weather_file::{
-    epw_weather_data_to_external_conditions, ExternalConditions,
+    cibse_weather_data_to_external_conditions, epw_weather_data_to_external_conditions,
+    ExternalConditions,
 };
 use home_energy_model::{run_project_from_input_file, OutputFormat};
 use std::ffi::OsStr;
@@ -24,6 +25,7 @@ struct SapArgs {
         long,
         value_enum,
         num_args = 1..=2,
+        default_value = "csv",
         help = "output format(s): csv, json, or both; default to csv"
     )]
     output: Option<Vec<OutputFormat>>,
@@ -84,11 +86,7 @@ fn main() -> anyhow::Result<()> {
     output_path.push(format!("{}__results", input_file_stem.to_str().unwrap()));
     fs::create_dir_all(&output_path)?;
     let input_file_name = input_file_stem.file_name().unwrap().to_str().unwrap();
-    let output_type = "core";
-    let file_output = FileOutputWriter::new(
-        output_path,
-        format!("{input_file_name}__{output_type}__{{}}.{{}}"),
-    );
+    let file_output = FileOutputWriter::new(output_path, format!("{input_file_name}__{{}}.{{}}"));
 
     let external_conditions: Option<ExternalConditions> = match args.weather_file {
         WeatherFileType {
@@ -104,13 +102,20 @@ fn main() -> anyhow::Result<()> {
         }
         WeatherFileType {
             epw_file: None,
-            cibse_weather_file: Some(_),
-        } => None,
+            cibse_weather_file: Some(ref file),
+        } => {
+            let external_conditions_data =
+                cibse_weather_data_to_external_conditions(File::open(file)?);
+            match external_conditions_data {
+                Ok(data) => Some(data),
+                Err(_) => panic!("Could not parse the weather file!"),
+            }
+        }
         _ => None,
     };
 
     run_project_from_input_file(
-        BufReader::new(File::open(Path::new(input_file))?),
+        BufReader::new(File::open(Path::new(input_file))?).into(),
         &file_output,
         external_conditions,
         args.output.as_ref(),

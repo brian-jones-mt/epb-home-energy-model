@@ -11,10 +11,11 @@ pub mod core;
 pub mod corpus;
 pub mod errors;
 
-mod hem_core;
+pub mod hem_core;
 
 pub mod input;
-mod output;
+mod input_dependency_resolvers;
+pub mod output;
 pub mod output_writer;
 pub mod read_weather_file;
 pub mod statistics;
@@ -28,7 +29,10 @@ use crate::external_conditions::ExternalConditions;
 use crate::input::{ExternalConditionsInput, HotWaterSourceDetails, Input};
 use crate::output::{Output, OutputEmitters, OutputStatic, OUTPUT_ZONE_DATA_FIELD_HEADINGS};
 use crate::output_writer::OutputWriter;
-use crate::read_weather_file::ExternalConditions as ExternalConditionsFromFile;
+use crate::read_weather_file::{
+    cibse_weather_data_to_external_conditions, epw_weather_data_to_external_conditions,
+    ExternalConditions as ExternalConditionsFromFile, ReadWeatherFileResult,
+};
 use crate::simulation_time::SimulationTime;
 use anyhow::{anyhow, bail};
 use convert_case::{Case, Casing};
@@ -37,7 +41,10 @@ use erased_serde::Serialize as ErasedSerialize;
 use hem_core::external_conditions;
 use hem_core::simulation_time;
 use indexmap::IndexMap;
-use serde::{Serialize, Serializer};
+use itertools::Itertools;
+use jsonschema::Validator;
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::Value;
 use smartstring::alias::String;
 use std::borrow::Cow;
 use std::fmt::{Debug, Display, Formatter};
@@ -45,16 +52,39 @@ use std::io::Read;
 use std::ops::AddAssign;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, LazyLock};
+use thiserror::Error;
 use tracing::{debug, instrument};
 
-pub const HEM_VERSION: &str = "1.0.0a1";
-pub const HEM_VERSION_DATE: &str = "2025-10-02";
+pub const HEM_VERSION: &str = "1.0.0a7";
+pub const HEM_VERSION_DATE: &str = "2026-02-27";
 
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum OutputFormat {
     Json,
     Csv,
+}
+
+fn format_value(value: &StringOrNumber) -> anyhow::Result<std::string::String> {
+    Ok(match value {
+        StringOrNumber::Float(f) => {
+            if is_close!(*f, 0., abs_tol = 1e-10, rel_tol = 1e-9) {
+                "0.0".to_string()
+            } else {
+                // Round any floating point numbers to 10 significant figures, like the Python does
+                format!("{:.9e}", f).parse::<f64>()?.to_string()
+            }
+        }
+        _ => value.to_string(),
+    })
+}
+
+fn format_row(row: &[StringOrNumber]) -> anyhow::Result<Vec<std::string::String>> {
+    let mut formatted_row: Vec<std::string::String> = Vec::new();
+    for value in row {
+        formatted_row.push(format_value(value)?);
+    }
+    Ok(formatted_row)
 }
 
 #[derive(Serialize)]
@@ -75,9 +105,20 @@ impl HemResponse {
     }
 }
 
+pub enum RunInput<'a> {
+    Json(Value),
+    Read(Box<dyn Read + 'a>),
+}
+
+impl<'a, T: Read + 'a> From<T> for RunInput<'a> {
+    fn from(value: T) -> Self {
+        RunInput::Read(Box::new(value))
+    }
+}
+
 #[instrument(skip_all)]
 pub fn run_project_from_input_file(
-    input: impl Read,
+    input: RunInput<'_>,
     output_writer: &impl OutputWriter,
     external_conditions_data: Option<ExternalConditionsFromFile>,
     output_formats: Option<&Vec<OutputFormat>>,
@@ -86,20 +127,28 @@ pub fn run_project_from_input_file(
     detailed_output_heating_cooling: bool,
 ) -> Result<CalculationResult, HemError> {
     #[instrument(skip_all)]
-    fn finalize(input: impl Read) -> anyhow::Result<Input> {
-        let input = serde_json::from_reader(input)?;
-        // NB. this _might_ in time be a good point to perform a validation against the core schema - or it might not
-        // if let BasicOutput::Invalid(errors) =
-        //     CORE_INCLUDING_FHS_VALIDATOR.apply(&self.input).basic()
-        // {
-        //     bail!(
-        //         "Wrapper formed invalid JSON for the core schema: {}",
-        //         serde_json::to_value(errors)?.to_json_string_pretty()?
-        //     );
-        // }
+    fn finalize(input: Value) -> anyhow::Result<Input> {
+        let evaluation = CORE_SCHEMA_VALIDATOR.evaluate(&input);
+        if !evaluation.flag().valid {
+            bail!(
+                "Wrapper formed invalid JSON for the core schema: {}",
+                evaluation
+                    .iter_errors()
+                    .map(|e| format!("{}: {}", e.instance_location, e.error))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
 
         serde_json::from_value(input).map_err(|err| anyhow!(err))
     }
+
+    let input = match input {
+        RunInput::Json(json) => json,
+        RunInput::Read(read) => {
+            serde_json::from_reader(read).map_err(|err| HemError::InvalidRequest(anyhow!(err)))?
+        }
+    };
     let input = finalize(input)?;
 
     let results = run_project(
@@ -112,11 +161,12 @@ pub fn run_project_from_input_file(
 
     if let Some(output_formats) = output_formats {
         let steps_in_hours = results.input.simulation_time.step;
-
+        let output_mode = "core";
         write_core_output_files(
             &results.output,
             results.input.as_ref(),
             output_writer,
+            output_mode,
             output_formats,
             steps_in_hours,
             heat_balance,
@@ -230,10 +280,11 @@ pub fn run_project(
 }
 
 #[instrument(skip_all)]
-fn write_core_output_files(
+pub fn write_core_output_files(
     output: &Output,
     primary_input: &Input,
     output_writer: &impl OutputWriter,
+    output_mode: &str,
     output_formats: &[OutputFormat],
     hour_per_step: f64,
     heat_balance: bool,
@@ -250,15 +301,21 @@ fn write_core_output_files(
     if output_formats.contains(&OutputFormat::Csv) {
         let input = primary_input;
 
-        write_core_output_file_static(&output.static_, "results_static", output_writer)?;
+        let output_key = format!("{output_mode}__results_static");
+        write_core_output_file_static(&output.static_, &output_key, output_writer)?;
 
-        write_core_output_file(output, "results", output_writer)?;
+        let output_key = format!("{output_mode}__results");
+        write_core_output_file(output, &output_key, output_writer)?;
 
-        write_core_output_file_summary(output, "results_summary", output_writer, input)?;
+        let output_key = format!("{output_mode}__results_summary");
+        write_core_output_file_summary(output, &output_key, output_writer, input)?;
 
         if heat_balance {
             for (hb_name, hb_map) in &output.core.heat_balance_all {
-                let output_key = format!("results_heat_balance_{}", hb_name.to_case(Case::Snake));
+                let output_key = format!(
+                    "{output_mode}__results_heat_balance_{}",
+                    hb_name.to_case(Case::Snake)
+                );
                 write_core_output_file_heat_balance(
                     output_key.as_str(),
                     &output.core.timestep_array,
@@ -273,7 +330,8 @@ fn write_core_output_files(
             for (heat_source_wet_name, heat_source_wet_results) in
                 &output.core.heat_source_wet_results
             {
-                let output_key = format!("results_heat_source_wet__{heat_source_wet_name}");
+                let output_key =
+                    format!("{output_mode}__results_heat_source_wet__{heat_source_wet_name}");
                 write_core_output_file_heat_source_wet(
                     output_key.as_str(),
                     &output.core.timestep_array,
@@ -285,7 +343,9 @@ fn write_core_output_files(
             for (heat_source_wet_name, heat_source_wet_results_annual) in
                 &output.core.heat_source_wet_results_annual
             {
-                let output_key = format!("results_heat_source_wet__{heat_source_wet_name}");
+                let output_key = format!(
+                    "{output_mode}__results_heat_source_wet_summary__{heat_source_wet_name}"
+                );
                 write_core_output_file_heat_source_wet_summary(
                     output_key.as_str(),
                     heat_source_wet_results_annual,
@@ -294,21 +354,21 @@ fn write_core_output_files(
             }
 
             // Function call to write detailed ventilation results
-            let vent_output_key = "ventilation_results";
+            let vent_output_key = format!("{output_mode}__ventilation_results");
             write_core_output_file_ventilation_detailed(
-                vent_output_key,
+                &vent_output_key,
                 &output.core.ventilation,
                 output_writer,
             )?;
 
             for (hot_water_source_name, hot_water_source_results) in
-                &output.core.hot_water_source_results_summary
+                &output.core.hot_water_source_results
             {
                 let hot_water_source_file = format!(
-                    "results_hot_water_source_summary__{}",
+                    "{output_mode}__results_hot_water_source__{}",
                     hot_water_source_name.replace(" ", "_")
                 );
-                write_core_output_file_hot_water_source_summary(
+                write_core_output_file_hot_water_source(
                     hot_water_source_file.as_str(),
                     hot_water_source_results,
                     output_writer,
@@ -316,17 +376,17 @@ fn write_core_output_files(
             }
 
             // Create a file for emitters detailed output and write
-            let emitters_output_prefix = "results_emitters_";
+            let emitters_output_prefix = format!("{output_mode}__results_emitters__");
             write_core_output_file_emitters_detailed(
-                emitters_output_prefix,
+                &emitters_output_prefix,
                 &output.core.emitters,
                 output_writer,
             )?;
 
             // Create a file for esh detailed output and write
-            let esh_output_prefix = "results_esh_";
+            let esh_output_prefix = format!("{output_mode}__results_esh_");
             write_core_output_file_esh_detailed(
-                esh_output_prefix,
+                &esh_output_prefix,
                 &output.core.electric_storage_heaters,
                 output_writer,
             )?;
@@ -438,7 +498,7 @@ fn write_core_output_file(
     }
 
     headings.push("Ventilation: Ductwork gains".into());
-    units_row.push("[kWh]");
+    units_row.push("[W]");
 
     for zone in output.core.zone_list.iter() {
         for field_name in OUTPUT_ZONE_DATA_FIELD_HEADINGS {
@@ -523,6 +583,8 @@ fn write_core_output_file(
         headings.push(format!("{totals_key}: import").into());
         units_row.push("[kWh]");
         headings.push(format!("{totals_key}: export").into());
+        units_row.push("[kWh]");
+        headings.push(format!("{totals_key}: generation to grid").into());
         units_row.push("[kWh]");
         headings.push(format!("{totals_key}: generated and consumed").into());
         units_row.push("[kWh]");
@@ -613,7 +675,7 @@ fn write_core_output_file(
                 .collect(),
         );
 
-        writer.write_record(row.iter().map(StringOrNumber::as_bytes))?;
+        writer.write_record(format_row(&row)?)?;
     }
 
     Ok(())
@@ -715,12 +777,12 @@ fn write_core_output_file_summary(
     writer.write_record([
         "Space heat demand".to_string(),
         "kWh/m2".to_string(),
-        output.summary.space_heat_demand_by_floor_area().to_string(),
+        format_value(&output.summary.space_heat_demand_by_floor_area().into())?,
     ])?;
     writer.write_record([
         "Space cool demand".to_string(),
         "kWh/m2".to_string(),
-        output.summary.space_cool_demand_by_floor_area().to_string(),
+        format_value(&output.summary.space_cool_demand_by_floor_area().into())?,
     ])?;
     writer.write_record(&blank_line)?;
     writer.write_record(["Energy Supply Summary"])?;
@@ -728,13 +790,12 @@ fn write_core_output_file_summary(
 
     let peak_consumption = &output.summary.electricity_peak_consumption;
     writer.write_record([
-        "Peak half-hour consumption (electricity)".to_string(), // TODO (from Python) technically per-step, not half-hour
-        peak_consumption.peak.to_string(),
+        "Peak consumption (electricity)".to_string(),
+        format_value(&peak_consumption.peak.into())?,
         peak_consumption.index.to_string(),
-        peak_consumption.index.to_string(),
-        MONTH_NAMES[peak_consumption.month as usize].to_string(),
+        month_name(peak_consumption.month)?.to_string(),
         peak_consumption.day.to_string(),
-        peak_consumption.hour.to_string(),
+        format_value(&peak_consumption.hour.into())?,
     ])?;
     writer.write_record(&blank_line)?;
 
@@ -743,16 +804,8 @@ fn write_core_output_file_summary(
     writer.write_record(&header_row)?;
     let fields = [
         // Label, unit, OutputSummaryEnergySupply field
-        (
-            "Consumption",
-            "kWh",
-            EnergySupplyStatKey::ElectricityConsumed,
-        ),
-        (
-            "Generation",
-            "kWh",
-            EnergySupplyStatKey::ElectricityGenerated,
-        ),
+        ("Consumption", "kWh", EnergySupplyStatKey::Consumption),
+        ("Generation", "kWh", EnergySupplyStatKey::Generation),
         (
             "Generation to consumption (immediate excl. diverter)",
             "kWh",
@@ -769,7 +822,7 @@ fn write_core_output_file_summary(
             EnergySupplyStatKey::GenerationToDiverter,
         ),
         (
-            "Generation to grid (export)",
+            "Generation to grid",
             "kWh",
             EnergySupplyStatKey::GenerationToGrid,
         ),
@@ -784,9 +837,19 @@ fn write_core_output_file_summary(
             EnergySupplyStatKey::StorageFromGrid,
         ),
         (
-            "Grid to consumption (import)",
+            "Grid to consumption",
             "kWh",
             EnergySupplyStatKey::GridToConsumption,
+        ),
+        (
+            "Total gross import",
+            "kWh",
+            EnergySupplyStatKey::TotalGrossImport,
+        ),
+        (
+            "Total gross export",
+            "kWh",
+            EnergySupplyStatKey::TotalGrossExport,
         ),
         ("Net import", "kWh", EnergySupplyStatKey::NetImport),
         (
@@ -799,12 +862,16 @@ fn write_core_output_file_summary(
         let mut row: Vec<std::string::String> = vec![label.into(), unit.into()];
         for stat in output.summary.energy_supply.values() {
             let value = stat.field(&field);
-            let value = if field == EnergySupplyStatKey::StorageEfficiency && value.is_nan() {
-                "DIV/0".into()
+            let value = if value.is_some_and(|value| field == EnergySupplyStatKey::StorageEfficiency && value.is_nan()) {
+                StringOrNumber::String("DIV/0".into())
             } else {
-                value.to_string()
+                if let Some(value) = value {
+                    StringOrNumber::from(value)
+                } else {
+                    StringOrNumber::String("N/A".into())
+                }
             };
-            row.push(value);
+            row.push(value.to_string());
         }
         writer.write_record(&row)?;
     }
@@ -816,7 +883,7 @@ fn write_core_output_file_summary(
             .map(|x| format!("{}", x).into_bytes()),
     )?;
     for row in delivered_energy_rows {
-        writer.write_record(row.iter().map(|x| format!("{}", x).into_bytes()))?;
+        writer.write_record(format_row(&row)?)?;
     }
 
     if !dhw_cop_rows.is_empty() {
@@ -849,21 +916,21 @@ fn write_core_output_file_summary(
             });
         }
         for row in dhw_cop_rows {
-            writer.write_record(row.iter().map(|x| format!("{}", x).into_bytes()))?;
+            writer.write_record(format_row(&row)?)?;
         }
     }
     if !heat_cop_rows.is_empty() {
         writer.write_record(&blank_line)?;
         writer.write_record(["Space heating system", "Overall CoP"])?;
         for row in heat_cop_rows {
-            writer.write_record(row.iter().map(|x| format!("{}", x).into_bytes()))?;
+            writer.write_record(format_row(&row)?)?;
         }
     }
     if !cool_cop_rows.is_empty() {
         writer.write_record(&blank_line)?;
         writer.write_record(["Space cooling system", "Overall CoP"])?;
         for row in cool_cop_rows {
-            writer.write_record(row.iter().map(|x| format!("{}", x).into_bytes()))?;
+            writer.write_record(format_row(&row)?)?;
         }
     }
 
@@ -876,6 +943,18 @@ fn write_core_output_file_summary(
 const MONTH_NAMES: [&str; 12] = [
     "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
 ];
+
+#[derive(Debug, Clone, Copy, Error)]
+#[error("Invalid month number (expected 1-12): {0}")]
+struct InvalidMonthNumberError(u8);
+
+fn month_name(month: u8) -> Result<&'static str, InvalidMonthNumberError> {
+    match month {
+        0 => Err(InvalidMonthNumberError(0)),
+        1..=12 => Ok(MONTH_NAMES[month as usize - 1]),
+        x => Err(InvalidMonthNumberError(x)),
+    }
+}
 
 fn write_output_json_file(
     output_key: &str,
@@ -896,10 +975,12 @@ fn write_output_json_file(
 
 #[derive(Clone, Copy)]
 struct EnergySupplyStat {
-    elec_generated: f64,
-    elec_consumed: f64,
+    generation: f64,
+    consumption: f64,
     gen_to_consumption: f64,
     grid_to_consumption: f64,
+    total_gross_import: f64,
+    total_gross_export: f64,
     generation_to_grid: f64,
     net_import: f64,
     gen_to_storage: f64,
@@ -912,12 +993,14 @@ struct EnergySupplyStat {
 impl EnergySupplyStat {
     fn display_for_key(&self, key: &EnergySupplyStatKey) -> String {
         match key {
-            EnergySupplyStatKey::ElectricityGenerated => self.elec_generated.to_string().into(),
-            EnergySupplyStatKey::ElectricityConsumed => self.elec_consumed.to_string().into(),
+            EnergySupplyStatKey::Generation => self.generation.to_string().into(),
+            EnergySupplyStatKey::Consumption => self.consumption.to_string().into(),
             EnergySupplyStatKey::GenerationToConsumption => {
                 self.gen_to_consumption.to_string().into()
             }
             EnergySupplyStatKey::GridToConsumption => self.grid_to_consumption.to_string().into(),
+            EnergySupplyStatKey::TotalGrossImport => self.total_gross_import.to_string().into(),
+            EnergySupplyStatKey::TotalGrossExport => self.total_gross_export.to_string().into(),
             EnergySupplyStatKey::GenerationToGrid => self.generation_to_grid.to_string().into(),
             EnergySupplyStatKey::NetImport => self.net_import.to_string().into(),
             EnergySupplyStatKey::GenerationToStorage => self.gen_to_storage.to_string().into(),
@@ -933,10 +1016,12 @@ impl EnergySupplyStat {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum EnergySupplyStatKey {
-    ElectricityGenerated,
-    ElectricityConsumed,
+    Generation,
+    Consumption,
     GenerationToConsumption,
     GridToConsumption,
+    TotalGrossImport,
+    TotalGrossExport,
     GenerationToGrid,
     NetImport,
     GenerationToStorage,
@@ -1058,14 +1143,13 @@ fn write_core_output_file_heat_balance(
 
     writer.write_record(&headings_annual)?;
     writer.write_record(&units_annual)?;
-    writer.write_record(annual_totals.iter().map(|x| format!("{}", x).into_bytes()))?;
+    writer.write_record(format_row(&annual_totals)?)?;
     writer.write_record([""])?;
     writer.write_record(&headings)?;
     writer.write_record(&units_row)?;
     for row in rows {
-        writer.write_record(row.iter().map(|x| format!("{}", x).into_bytes()))?;
+        writer.write_record(format_row(&row)?)?;
     }
-
     Ok(())
 }
 
@@ -1092,20 +1176,14 @@ fn write_core_output_file_heat_source_wet(
                 .keys()
                 .cloned()
                 .collect::<IndexMap<_, _>>()
-                .values()
-                .map(|col_heading| match col_heading {
-                    None => service_name.clone(),
-                    Some(col_heading) => format!("{service_name}: {col_heading}").into(),
-                })
+                .keys()
+                .map(|col_heading| format!("{service_name}: {col_heading}").into())
                 .collect::<Vec<Arc<str>>>(),
         );
         col_units_row.extend(
             service_results
                 .keys()
-                .cloned()
-                .collect::<IndexMap<_, _>>()
-                .keys()
-                .cloned()
+                .map(|(_, col_unit)| col_unit.clone().unwrap_or_default())
                 .collect::<Vec<Arc<str>>>(),
         );
     }
@@ -1129,7 +1207,7 @@ fn write_core_output_file_heat_source_wet(
 
     // Write rows
     for t_idx in 0..timestep_array.len() {
-        let mut row: Vec<String> = vec![t_idx.to_string().into()];
+        let mut row: Vec<StringOrNumber> = vec![t_idx.to_string().into()];
         for (service_name, service_results) in heat_source_wet_results {
             row.extend(
                 columns[service_name]
@@ -1137,7 +1215,7 @@ fn write_core_output_file_heat_source_wet(
                     .map(|col| service_results[col][t_idx].clone().into()),
             );
         }
-        writer.write_record(row.iter().map(|x| x.to_string().into_bytes()))?;
+        writer.write_record(format_row(&row)?)?;
     }
 
     Ok(())
@@ -1157,7 +1235,7 @@ fn write_core_output_file_heat_source_wet_summary(
             writer.write_record([
                 name.0.as_bytes(),
                 name.1.as_ref().map(|x| x.as_bytes()).unwrap_or_default(),
-                String::from(value).as_bytes(),
+                String::from(format_value(&StringOrNumber::from(value))?).as_bytes(),
             ])?;
         }
         writer.write_record([""])?;
@@ -1210,7 +1288,27 @@ fn write_core_output_file_emitters_detailed(
             "[kWh]",
         ])?;
         for emitters_detailed_result in emitters_detailed_results.values() {
-            writer.serialize(emitters_detailed_result)?;
+            let row: &[StringOrNumber] = &[
+                StringOrNumber::from(emitters_detailed_result.simulation_time_idx),
+                StringOrNumber::from(emitters_detailed_result.energy_demand),
+                StringOrNumber::from(emitters_detailed_result.temp_emitter_required),
+                StringOrNumber::from(emitters_detailed_result.time_heating_start),
+                StringOrNumber::from(emitters_detailed_result.energy_provided_by_heat_source),
+                emitters_detailed_result.temp_emitter.clone(),
+                StringOrNumber::from(emitters_detailed_result.temp_emitter_max),
+                StringOrNumber::from(emitters_detailed_result.energy_released_from_emitters),
+                StringOrNumber::from(emitters_detailed_result.temp_flow_target),
+                StringOrNumber::from(emitters_detailed_result.temp_return_target),
+                StringOrNumber::from(
+                    emitters_detailed_result
+                        .temp_emitter_max_is_final_temp
+                        .to_string(),
+                ),
+                StringOrNumber::from(emitters_detailed_result.energy_required_from_heat_source),
+                StringOrNumber::from(emitters_detailed_result.fan_energy_kwh),
+            ];
+
+            writer.write_record(format_row(row)?)?;
         }
     }
 
@@ -1246,7 +1344,8 @@ fn write_core_output_file_esh_detailed(
         writer.write_record(headings)?;
         writer.write_record(units_row)?;
         for esh_results in esh_output.values() {
-            writer.serialize(esh_results)?;
+            let row = esh_results.iter().map(StringOrNumber::from).collect_vec();
+            writer.write_record(format_row(&row)?)?;
         }
 
         writer.flush()?;
@@ -1315,13 +1414,13 @@ fn write_core_output_file_ventilation_detailed(
     ])?;
 
     for ventilation_results in vent_output_list.iter() {
-        writer.write_record(ventilation_results.iter().map(StringOrNumber::as_bytes))?;
+        writer.write_record(format_row(ventilation_results)?)?;
     }
 
     Ok(())
 }
 
-fn write_core_output_file_hot_water_source_summary(
+fn write_core_output_file_hot_water_source(
     output_key: &str,
     hot_water_source_results: &[Vec<StringOrNumber>],
     output_writer: &impl OutputWriter,
@@ -1330,14 +1429,14 @@ fn write_core_output_file_hot_water_source_summary(
     let mut writer = WriterBuilder::new().flexible(true).from_writer(writer);
 
     for hot_water_source_row in hot_water_source_results {
-        writer.write_record(hot_water_source_row.iter().map(StringOrNumber::as_bytes))?;
+        writer.write_record(format_row(hot_water_source_row)?)?;
     }
 
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
-enum StringOrNumber {
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub enum StringOrNumber {
     String(String),
     Float(f64),
     Integer(usize),
@@ -1484,3 +1583,26 @@ impl From<&ExternalConditionsFromFile> for ExternalConditionsInput {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WeatherFileType {
+    // the EPW weather file format
+    Epw,
+    // the weather file format used by CIBSE
+    Cibse,
+}
+
+pub fn load_weather_data(
+    input: impl Read,
+    weather_file_type: WeatherFileType,
+) -> ReadWeatherFileResult<ExternalConditionsFromFile> {
+    match weather_file_type {
+        WeatherFileType::Epw => epw_weather_data_to_external_conditions(input),
+        WeatherFileType::Cibse => cibse_weather_data_to_external_conditions(input),
+    }
+}
+
+static CORE_SCHEMA_VALIDATOR: LazyLock<Validator> = LazyLock::new(|| {
+    let schema = serde_json::from_str(include_str!("../schemas/core-input.schema.json")).unwrap();
+    jsonschema::validator_for(&schema).unwrap()
+});

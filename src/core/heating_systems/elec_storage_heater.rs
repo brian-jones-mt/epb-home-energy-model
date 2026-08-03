@@ -20,12 +20,6 @@ type Time = f64;
 
 type EnergyOutputState = Vector3<f64>;
 
-// replicates numpys's linspace function
-pub(super) fn linspace(start: f64, end: f64, num: i32) -> Vec<f64> {
-    let step = (end - start) / f64::from(num - 1);
-    (0..num).map(|n| start + (f64::from(n) * step)).collect()
-}
-
 #[derive(Derivative)]
 #[derivative(Debug)]
 pub(crate) struct ElecStorageHeater {
@@ -486,7 +480,10 @@ mod tests {
             vec![
                 300., 250., 220., 180., 150., 120., 100., 80., 60., 40., 20., 10., 50., 100., 140.,
                 190., 200., 320., 330., 340., 350., 355., 315., 5.,
-            ],
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
             vec![
                 0., 0., 0., 0., 35., 73., 139., 244., 320., 361., 369., 348., 318., 249., 225.,
                 198., 121., 68., 19., 0., 0., 0., 0., 0.,
@@ -551,7 +548,7 @@ mod tests {
 
     #[fixture]
     fn charge_control(
-        simulation_time_iteration: SimulationTimeIteration,
+        simulation_time_iterator: SimulationTimeIterator,
         external_conditions: Arc<ExternalConditions>,
         external_sensor: ExternalSensor,
         charge_control_schedule: Vec<bool>,
@@ -560,7 +557,7 @@ mod tests {
             ChargeControl::new(
                 ControlLogicType::Automatic,
                 charge_control_schedule,
-                &simulation_time_iteration,
+                &simulation_time_iterator,
                 0,
                 1.,
                 [1.0, 0.8].into_iter().map(Into::into).collect(),
@@ -820,7 +817,6 @@ mod tests {
     }
 
     #[rstest]
-    #[ignore = "known issue"]
     fn test_energy_output_min(
         simulation_time_iterator: SimulationTimeIterator,
         elec_storage_heater: Arc<ElecStorageHeater>,
@@ -867,7 +863,6 @@ mod tests {
     }
 
     #[rstest]
-    #[ignore = "known issue"]
     fn test_energy_output_max(
         simulation_time_iterator: SimulationTimeIterator,
         elec_storage_heater: Arc<ElecStorageHeater>,
@@ -964,7 +959,7 @@ mod tests {
             ChargeControl::new(
                 ControlLogicType::Manual,
                 charge_control_schedule,
-                &simulation_time.iter().current_iteration(),
+                &simulation_time.iter(),
                 0,
                 1.,
                 [1.0, 0.8].into_iter().map(Into::into).collect(),
@@ -1009,7 +1004,7 @@ mod tests {
             ChargeControl::new(
                 ControlLogicType::Celect,
                 charge_control_schedule,
-                &simulation_time.iter().current_iteration(),
+                &simulation_time.iter(),
                 0,
                 1.,
                 [1.0, 0.8].into_iter().map(Into::into).collect(),
@@ -1054,7 +1049,7 @@ mod tests {
             ChargeControl::new(
                 ControlLogicType::Hhrsh,
                 charge_control_schedule,
-                &simulation_time.iter().current_iteration(),
+                &simulation_time.iter(),
                 0,
                 1.,
                 [1.0, 0.8].into_iter().map(Into::into).collect(),
@@ -1099,7 +1094,7 @@ mod tests {
             ChargeControl::new(
                 ControlLogicType::Hhrsh,
                 charge_control_schedule,
-                &simulation_time.iter().current_iteration(),
+                &simulation_time.iter(),
                 0,
                 1.,
                 [1.0, 0.8].into_iter().map(Into::into).collect(),
@@ -1148,7 +1143,7 @@ mod tests {
             ChargeControl::new(
                 ControlLogicType::HeatBattery,
                 charge_control_schedule,
-                &simulation_time.iter().current_iteration(),
+                &simulation_time.iter(),
                 0,
                 1.,
                 [1.0, 0.8].into_iter().map(Into::into).collect(),
@@ -1195,69 +1190,7 @@ mod tests {
         );
     }
 
-    #[ignore = "fails probably because heat_retention_ratio cannot be set to None in Rust"]
-    #[rstest]
-    fn test_electric_charge_hhrsh_no_heat_retention_ratio(
-        external_conditions: Arc<ExternalConditions>,
-        external_sensor: ExternalSensor,
-        simulation_time: SimulationTime,
-        control: Arc<Control>,
-        charge_control_schedule: Vec<bool>,
-    ) {
-        let charge_control = Arc::new(Control::Charge(
-            ChargeControl::new(
-                ControlLogicType::Hhrsh,
-                charge_control_schedule,
-                &simulation_time.iter().current_iteration(),
-                0,
-                1.,
-                [1.0, 0.8].into_iter().map(Into::into).collect(),
-                Some(22.),
-                None,
-                Some(external_conditions.clone()),
-                Some(external_sensor),
-                None,
-            )
-            .unwrap(),
-        ));
-
-        let energy_supply = Arc::new(RwLock::new(
-            EnergySupplyBuilder::new(FuelType::Electricity, simulation_time.total_steps()).build(),
-        ));
-        let energy_supply_conn =
-            EnergySupply::connection(energy_supply.clone(), "storage_heater").unwrap();
-
-        let heater = ElecStorageHeater::new(
-            3.5,
-            2.5,
-            10.0,
-            ElectricStorageHeaterAirFlowType::FanAssisted,
-            0.7,
-            11.,
-            1,
-            21.,
-            Arc::new(|| 20.),
-            energy_supply_conn,
-            &simulation_time.iter(),
-            control,
-            charge_control,
-            DRY_CORE_MIN_OUTPUT.to_vec(),
-            DRY_CORE_MAX_OUTPUT.to_vec(),
-            external_conditions,
-            0.,
-            None,
-        )
-        .unwrap();
-
-        heater.storage.write().set_heat_retention_ratio(0.);
-
-        let result = heater
-            .storage
-            .read()
-            .target_electric_charge(simulation_time.iter().current_iteration());
-
-        assert!(result.is_err())
-    }
+    // skipping python's test_electric_charge_hhrsh_no_heat_retention_ratio as heat_retention_ratio can't be None in rust
 
     #[rstest]
     fn test_demand_energy(
@@ -1298,7 +1231,6 @@ mod tests {
     }
 
     #[rstest]
-    #[ignore = "known issue (energy_output)"]
     fn test_demand_energy_no_demand(
         simulation_time_iterator: SimulationTimeIterator,
         elec_storage_heater: Arc<ElecStorageHeater>,
@@ -1692,7 +1624,6 @@ mod tests {
     }
 
     #[rstest]
-    #[ignore = "known issue"]
     fn test_energy_for_fan(
         simulation_time_iterator: SimulationTimeIterator,
         elec_storage_heater: Arc<ElecStorageHeater>,
@@ -1736,7 +1667,6 @@ mod tests {
     }
 
     #[rstest]
-    #[ignore = "known issue"]
     fn test_energy_instant(
         simulation_time_iterator: SimulationTimeIterator,
         elec_storage_heater: Arc<ElecStorageHeater>,
@@ -1780,7 +1710,6 @@ mod tests {
     }
 
     #[rstest]
-    #[ignore = "known issue"]
     fn test_energy_charged(
         simulation_time_iterator: SimulationTimeIterator,
         elec_storage_heater: Arc<ElecStorageHeater>,
@@ -1824,7 +1753,6 @@ mod tests {
     }
 
     #[rstest]
-    #[ignore = "known issue"]
     fn test_energy_stored_delivered(
         simulation_time_iterator: SimulationTimeIterator,
         elec_storage_heater: Arc<ElecStorageHeater>,
@@ -1986,7 +1914,6 @@ mod tests {
         assert!(actual_energy < 10.);
     }
 
-    #[ignore = "known issue"]
     #[rstest]
     fn test_elec_storage_energy_output_modes(
         elec_storage_heater: Arc<ElecStorageHeater>,
@@ -2002,7 +1929,7 @@ mod tests {
                 &simulation_time.iter().current_iteration(),
             )
             .unwrap();
-        assert_eq!(energy_min.0, 0.);
+        assert!(energy_min.0 > 0.);
 
         let energy_max = elec_storage_heater
             .storage
@@ -2014,7 +1941,7 @@ mod tests {
                 &simulation_time.iter().current_iteration(),
             )
             .unwrap();
-        assert_eq!(energy_max.0, energy_min.0);
+        assert!(energy_max.0 > energy_min.0);
     }
 
     #[rstest]

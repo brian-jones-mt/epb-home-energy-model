@@ -2,6 +2,7 @@
 name = "hem-lambda-fuzz"
 version = "0.0.0"
 publish = false
+resolver = "3"
 edition = "2021"
 
 [package.metadata]
@@ -11,7 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 anyhow = "1.0.89"
 
-[dependencies.hem]
+[dependencies.home-energy-model]
 path = ".."
 features = ["arbitrary"]
 

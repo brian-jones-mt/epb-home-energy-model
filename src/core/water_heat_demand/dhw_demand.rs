@@ -1,5 +1,6 @@
 use crate::core::common::WaterSupplyBehaviour;
 use crate::core::energy_supply::energy_supply::{EnergySupply, EnergySupplyConnection};
+use crate::core::heating_systems::storage_tank::HotWaterStorageTank;
 use crate::core::heating_systems::wwhrs::WwhrsInstantaneous;
 use crate::core::pipework::{PipeworkLocation, PipeworkSimple, Pipeworkesque};
 use crate::core::schedule::{TypedScheduleEvent, WaterScheduleEventType};
@@ -12,7 +13,7 @@ use crate::core::water_heat_demand::misc::{
 use crate::core::water_heat_demand::other_hot_water_uses::OtherHotWater;
 use crate::core::water_heat_demand::shower::Shower;
 use crate::core::water_heat_demand::shower::{InstantElectricShower, MixerShower};
-use crate::corpus::{ColdWaterSources, EventSchedule, HotWaterSourceBehaviour};
+use crate::corpus::{ColdWaterSources, EventSchedule, HotWaterSource, HotWaterSourceBehaviour};
 use crate::input::{
     BathDetails, Baths as BathInput, OtherWaterUse, OtherWaterUses as OtherWaterUseInput,
     PipeworkContents, Shower as ShowerInput, Showers as ShowersInput,
@@ -20,28 +21,27 @@ use crate::input::{
 };
 use crate::simulation_time::SimulationTimeIteration;
 use anyhow::{anyhow, bail};
+use fsum::FSum;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use parking_lot::{Mutex, RwLock};
 use smartstring::alias::String;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) const ELECTRIC_SHOWERS_HWS_NAME: &str = "_electric_showers";
 
 #[derive(Debug)]
-pub(crate) struct DomesticHotWaterDemand<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour = T>
-{
-    showers: HashMap<String, Shower>,
-    baths: HashMap<String, Bath>,
-    other: HashMap<String, OtherHotWater>,
-    hot_water_sources: IndexMap<Arc<str>, T>,
+pub struct DomesticHotWaterDemand {
+    showers: IndexMap<String, Shower>,
+    baths: IndexMap<String, Bath>,
+    other: IndexMap<String, OtherHotWater>,
+    hot_water_sources: IndexMap<Arc<str>, HotWaterSource>,
     energy_supply_conn_unmet_demand: IndexMap<Arc<str>, EnergySupplyConnection>,
-    source_supplying_outlet: HashMap<(OutletType, Arc<str>), Arc<str>>,
+    source_supplying_outlet: IndexMap<(OutletType, Arc<str>), Arc<str>>,
     hot_water_distribution_pipework: IndexMap<Arc<str>, Vec<PipeworkSimple>>,
     event_schedules: EventSchedule,
-    pre_heated_water_sources: IndexMap<String, U>,
+    pre_heated_water_sources: IndexMap<String, HotWaterStorageTank>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,7 +75,7 @@ impl TappingPoint<'_> {
         event: WaterHeatingEvent,
         func_temp_hot_water: &'a (dyn Fn(f64) -> anyhow::Result<f64> + 'a),
         simtime: SimulationTimeIteration,
-    ) -> anyhow::Result<(Option<f64>, f64)> {
+    ) -> anyhow::Result<(Option<f64>, f64, f64)> {
         match self {
             TappingPoint::Shower(shower) => {
                 shower.hot_water_demand(event, func_temp_hot_water, simtime)
@@ -103,14 +103,14 @@ pub enum OutletType {
     Other,
 }
 
-impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDemand<T, U> {
+impl DomesticHotWaterDemand {
     // TODO (from Python) Enhance analysis for overlapping events
     // Part of draft code for future overlapping analysis of events
     // For pipework losses count only none overlapping events
     // Time of finalisation of the previous hot water event
     // __time_end_previous_event = 0.0
 
-    pub(crate) fn new(
+    pub fn new(
         showers_input: &ShowersInput,
         bath_input: &BathInput,
         other_hot_water_input: &OtherWaterUseInput,
@@ -119,10 +119,10 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
         wwhrs: &IndexMap<String, Arc<Mutex<WwhrsInstantaneous>>>,
         energy_supplies: &IndexMap<String, Arc<RwLock<EnergySupply>>>,
         event_schedules: EventSchedule,
-        hot_water_sources: IndexMap<Arc<str>, T>,
-        pre_heated_water_sources: IndexMap<String, U>,
+        hot_water_sources: IndexMap<Arc<str>, HotWaterSource>,
+        pre_heated_water_sources: IndexMap<String, HotWaterStorageTank>,
     ) -> anyhow::Result<Self> {
-        let showers: HashMap<String, Shower> = showers_input
+        let showers: IndexMap<String, Shower> = showers_input
             .0
             .iter()
             .map(|(name, shower)| {
@@ -131,13 +131,13 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                     shower_from_input(name, shower, cold_water_sources, energy_supplies, wwhrs)?,
                 ))
             })
-            .collect::<anyhow::Result<HashMap<_, _>>>()?;
-        let baths: HashMap<String, Bath> = bath_input
+            .collect::<anyhow::Result<IndexMap<_, _>>>()?;
+        let baths: IndexMap<String, Bath> = bath_input
             .0
             .iter()
             .map(|(name, bath)| (name.into(), input_to_bath(bath, cold_water_sources)))
             .collect();
-        let other: HashMap<String, OtherHotWater> = other_hot_water_input
+        let other: IndexMap<String, OtherHotWater> = other_hot_water_input
             .0
             .iter()
             .map(|(name, other)| {
@@ -188,8 +188,10 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
             .filter(|key| !hot_water_sources.keys().contains(key))
             .collect();
         if !pws_without_hws.is_empty() {
-            // TODO include names in error message
-            bail!("Distribution pipework defined for non-existent HotWaterSource(s)");
+            bail!(
+                "Distribution pipework defined for non-existent HotWaterSource(s): {:?}",
+                pws_without_hws
+            );
         }
 
         // hot water sources (not including point of use) without any pipework
@@ -204,8 +206,10 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                 // point of use doesn't need pipework - just add an empty vec
                 hw_pipework_inputs.insert(hws_name.clone(), vec![]);
             } else {
-                // TODO include name in error message
-                bail!("Distribution pipework not specified for HotWaterSource");
+                bail!(
+                    "Distribution pipework not specified for HotWaterSource: {:?}",
+                    hws_name
+                );
             };
         }
 
@@ -262,8 +266,8 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
         baths_dict: &BathInput,
         other_hw_users_dict: &OtherWaterUseInput,
         hot_water_sources: &IndexMap<Arc<str>, impl HotWaterSourceBehaviour>,
-    ) -> HashMap<(OutletType, Arc<str>), Arc<str>> {
-        let mut mapping = HashMap::<(OutletType, Arc<str>), Arc<str>>::default();
+    ) -> IndexMap<(OutletType, Arc<str>), Arc<str>> {
+        let mut mapping = IndexMap::<(OutletType, Arc<str>), Arc<str>>::default();
         for (shower_name, shower) in showers_dict.0.iter() {
             match shower {
                 ShowerInput::InstantElectricShower { .. } => {
@@ -346,7 +350,7 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
 
     fn temp_hot_water(
         &self,
-        hot_water_source: T,
+        hot_water_source: &HotWaterSource,
         volume_required_already: f64,
         volume_required: f64,
         simtime: SimulationTimeIteration,
@@ -356,14 +360,14 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
             volume_required_already,
             simtime,
         )?;
-        let sum_t_by_v: f64 = list_temperature_for_required_volume
-            .iter()
-            .map(|(t, v)| t * v)
-            .sum();
-        let sum_v: f64 = list_temperature_for_required_volume
-            .iter()
-            .map(|(_, v)| v)
-            .sum();
+        let sum_t_by_v = FSum::with_all(
+            list_temperature_for_required_volume
+                .iter()
+                .map(|(t, v)| t * v),
+        )
+        .value();
+        let sum_v =
+            FSum::with_all(list_temperature_for_required_volume.iter().map(|(_, v)| v)).value();
 
         // Return average hot water temperature for the required volume
         Ok(sum_t_by_v / sum_v)
@@ -411,7 +415,7 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
         }
     }
 
-    fn hot_water_demand<'a>(
+    pub fn hot_water_demand<'a>(
         &'a self,
         simtime: SimulationTimeIteration,
     ) -> anyhow::Result<HotWaterDemandResult> {
@@ -485,66 +489,62 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                     hot_water_source,
                     hw_demand_i,
                     hw_demand_target_i,
+                    event_duration_i,
                     energy_supply_conn_unmet_demand,
-                ): (
-                    Arc<str>,
-                    Option<&T>,
-                    Option<f64>,
-                    f64,
-                    Option<&EnergySupplyConnection>,
-                ) =
-                    match tapping_point {
-                        TappingPoint::Shower(Shower::InstantElectricShower(shower)) => {
-                            let hot_water_source_name = ELECTRIC_SHOWERS_HWS_NAME;
+                ) = match tapping_point {
+                    TappingPoint::Shower(Shower::InstantElectricShower(shower)) => {
+                        let hot_water_source_name = ELECTRIC_SHOWERS_HWS_NAME;
 
-                            let (hw_demand_i, hw_demand_target_i) =
-                                shower.hot_water_demand(event.into(), simtime)?;
-                            (
-                                hot_water_source_name.into(),
-                                None,
-                                Some(hw_demand_i),
-                                hw_demand_target_i,
-                                None,
+                        let (hw_demand_i, hw_demand_target_i, event_duration_i) =
+                            shower.hot_water_demand(event.into(), simtime)?;
+                        (
+                            hot_water_source_name.into(),
+                            None,
+                            Some(hw_demand_i),
+                            hw_demand_target_i,
+                            event_duration_i,
+                            None,
+                        )
+                    }
+                    _ => {
+                        let hot_water_source_name = self
+                            .source_supplying_outlet
+                            .get(&(tapping_point_type, tapping_point_name))
+                            .unwrap();
+
+                        let hot_water_source =
+                            self.hot_water_sources.get(hot_water_source_name).unwrap();
+
+                        let energy_supply_conn_unmet_demand = self
+                            .energy_supply_conn_unmet_demand
+                            .get(hot_water_source_name);
+
+                        let volume_required_already = hw_demand_volume[hot_water_source_name];
+
+                        let func = move |volume_required: f64| -> anyhow::Result<f64> {
+                            self.temp_hot_water(
+                                hot_water_source,
+                                volume_required_already,
+                                volume_required,
+                                simtime,
                             )
-                        }
-                        _ => {
-                            let hot_water_source_name = self
-                                .source_supplying_outlet
-                                .get(&(tapping_point_type, tapping_point_name))
-                                .unwrap();
+                        };
 
-                            let hot_water_source =
-                                self.hot_water_sources.get(hot_water_source_name).unwrap();
+                        let func_temp_hot_water: Box<dyn Fn(f64) -> anyhow::Result<f64> + 'a> =
+                            Box::new(func);
+                        let (hw_demand_i, hw_demand_target_i, event_duration_i) = tapping_point
+                            .hot_water_demand(event.into(), &func_temp_hot_water, simtime)?;
 
-                            let energy_supply_conn_unmet_demand = self
-                                .energy_supply_conn_unmet_demand
-                                .get(hot_water_source_name);
-
-                            let volume_required_already = hw_demand_volume[hot_water_source_name];
-
-                            let func = move |volume_required: f64| -> anyhow::Result<f64> {
-                                self.temp_hot_water(
-                                    hot_water_source.clone(),
-                                    volume_required_already,
-                                    volume_required,
-                                    simtime,
-                                )
-                            };
-
-                            let func_temp_hot_water: Box<dyn Fn(f64) -> anyhow::Result<f64> + 'a> =
-                                Box::new(func);
-                            let (hw_demand_i, hw_demand_target_i) = tapping_point
-                                .hot_water_demand(event.into(), &func_temp_hot_water, simtime)?;
-
-                            (
-                                hot_water_source_name.clone(),
-                                Some(hot_water_source),
-                                hw_demand_i,
-                                hw_demand_target_i,
-                                energy_supply_conn_unmet_demand,
-                            )
-                        }
-                    };
+                        (
+                            hot_water_source_name.clone(),
+                            Some(hot_water_source),
+                            hw_demand_i,
+                            hw_demand_target_i,
+                            event_duration_i,
+                            energy_supply_conn_unmet_demand,
+                        )
+                    }
+                };
 
                 let cold_water_source = tapping_point.get_cold_water_source();
 
@@ -552,14 +552,20 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                     *hw_demand_volume.get_mut(&hot_water_source_name).unwrap() += hw_demand_i;
                     let list_temperature_volume = cold_water_source
                         .get_temp_cold_water(hw_demand_target_i - hw_demand_i, simtime)?;
-                    let sum_t_by_v: f64 = list_temperature_volume.iter().map(|(t, v)| t * v).sum();
-                    let sum_v: f64 = list_temperature_volume.iter().map(|(_, v)| v).sum();
+                    let sum_t_by_v =
+                        FSum::with_all(list_temperature_volume.iter().map(|(t, v)| t * v)).value();
+                    let sum_v =
+                        FSum::with_all(list_temperature_volume.iter().map(|(_, v)| v)).value();
+
                     sum_t_by_v / sum_v
                 } else {
                     let list_temperature_volume =
                         cold_water_source.get_temp_cold_water(hw_demand_target_i, simtime)?;
-                    let sum_t_by_v: f64 = list_temperature_volume.iter().map(|(t, v)| t * v).sum();
-                    let sum_v: f64 = list_temperature_volume.iter().map(|(_, v)| v).sum();
+                    let sum_t_by_v =
+                        FSum::with_all(list_temperature_volume.iter().map(|(t, v)| t * v)).value();
+                    let sum_v =
+                        FSum::with_all(list_temperature_volume.iter().map(|(_, v)| v)).value();
+
                     sum_t_by_v / sum_v
                 };
 
@@ -570,8 +576,7 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                 );
 
                 *hw_energy_demand.get_mut(&hot_water_source_name).unwrap() += hw_energy_demand_i;
-                *hw_duration.get_mut(&hot_water_source_name).unwrap() +=
-                    Self::get_duration_for_tapping_point_event(&tapping_point, event);
+                *hw_duration.get_mut(&hot_water_source_name).unwrap() += event_duration_i;
                 *all_events.get_mut(&hot_water_source_name).unwrap() += 1;
 
                 if hw_demand_i.is_none() {
@@ -591,6 +596,7 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                     temperature_warm: event.temperature,
                     volume_warm: hw_demand_target_i,
                     volume_hot: hw_demand_i.unwrap(),
+                    event_duration: event_duration_i,
                 };
 
                 // Add pipework flushes after every event (except for IES)
@@ -603,13 +609,15 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                     .unwrap()
                     .push(event_result);
 
-                if event_result.volume_hot.abs() > 1e-10 && volume_hot_water_left > 0. {
+                if !is_close!(event_result.volume_hot, 0., abs_tol = 1e-10, rel_tol = 1e-9)
+                    && volume_hot_water_left > 0.
+                {
                     if let Some(hot_water_source) = hot_water_source {
                         let volume_required_already =
                             *hw_demand_volume.get(&hot_water_source_name).unwrap();
                         let volume_required = volume_hot_water_left;
                         let temperature_pipe_flush = self.temp_hot_water(
-                            hot_water_source.clone(),
+                            hot_water_source,
                             volume_required_already,
                             volume_required,
                             simtime,
@@ -622,6 +630,7 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                                 temperature_warm: temperature_pipe_flush,
                                 volume_warm: volume_required,
                                 volume_hot: volume_required,
+                                event_duration: 0.,
                             });
 
                         *hw_demand_volume.get_mut(&hot_water_source_name).unwrap() +=
@@ -704,7 +713,6 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                 pw_losses_internal_for_hws + pw_losses_external_for_hws,
             );
 
-            // TODO check timestep is correct here
             let gains_internal_dhw_for_hws = (pw_losses_internal_for_hws
                 + gains_internal_dhw_use_for_hws)
                 * (WATTS_PER_KILOWATT as f64)
@@ -719,11 +727,10 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
                 .get(hws_name)
                 .unwrap()
                 .iter()
-                .filter(|event| event.volume_hot.abs() > 1e-10)
+                .filter(|event| !is_close!(event.volume_hot, 0., abs_tol = 1e-10, rel_tol = 1e-9))
                 .copied()
                 .collect();
 
-            // TODO update demand_hot_water to accept usage_events
             hw_energy_output.insert(
                 hws_name.clone(),
                 hws.demand_hot_water(filtered_events.clone(), simtime)?,
@@ -731,15 +738,14 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
 
             // Convert from litres to kWh
             // Find underlying cold water source, ignoring pre-heat tanks
-
-            // NOTE - Python has some logic here to find a cold water source - assumption is that we don't need that here
             let cold_water_source = hws.get_cold_water_source();
             hw_energy_demand_at_hot_water_source.insert(hws_name.clone(), 0.);
             for event in &filtered_events {
                 let list_temperature_volume =
                     cold_water_source.get_temp_cold_water(event.volume_hot, simtime)?;
-                let sum_t_by_v: f64 = list_temperature_volume.iter().map(|(t, v)| t * v).sum();
-                let sum_v: f64 = list_temperature_volume.iter().map(|(_, v)| v).sum();
+                let sum_t_by_v =
+                    FSum::with_all(list_temperature_volume.iter().map(|(t, v)| t * v)).value();
+                let sum_v = FSum::with_all(list_temperature_volume.iter().map(|(_, v)| v)).value();
                 let cold_water_temperature = sum_t_by_v / sum_v;
 
                 *hw_energy_demand_at_hot_water_source
@@ -858,35 +864,14 @@ impl<T: HotWaterSourceBehaviour, U: HotWaterSourceBehaviour> DomesticHotWaterDem
             gains_internal_dhw_use,
         )
     }
-
-    fn get_duration_for_tapping_point_event(
-        tapping_point: &TappingPoint,
-        event: &TypedScheduleEvent,
-    ) -> f64 {
-        // In Python, for Baths, the hot_water_demand function mutates the event we pass in
-        // to avoid this in the Rust we replicate the logic here
-        match tapping_point {
-            TappingPoint::Bath(bath) => {
-                match event.duration {
-                    Some(duration) => duration,
-                    None => {
-                        // if no duration is specified for a Bath then a volume is required
-                        // to calculate the duration
-                        event.volume.unwrap() / bath.get_flowrate()
-                    }
-                }
-            }
-            _ => event.duration.unwrap(),
-        }
-    }
 }
 
-struct HotWaterDemandResult {
-    hw_demand_vol: IndexMap<Arc<str>, f64>,
-    hw_duration: IndexMap<Arc<str>, f64>,
-    no_events: IndexMap<Arc<str>, u32>,
-    hw_energy_demand_at_tapping_points: IndexMap<Arc<str>, f64>,
-    usage_events: IndexMap<Arc<str>, Vec<WaterEventResult>>,
+pub struct HotWaterDemandResult {
+    pub hw_demand_vol: IndexMap<Arc<str>, f64>,
+    pub hw_duration: IndexMap<Arc<str>, f64>,
+    pub no_events: IndexMap<Arc<str>, u32>,
+    pub hw_energy_demand_at_tapping_points: IndexMap<Arc<str>, f64>,
+    pub usage_events: IndexMap<Arc<str>, Vec<WaterEventResult>>,
 }
 
 pub(crate) struct WaterHeatingCalculation {
@@ -916,7 +901,10 @@ fn shower_from_input(
             flowrate,
             ..
         } => {
-            let cold_water_source = cold_water_sources.get(cold_water_source).unwrap().clone();
+            let cold_water_source = cold_water_sources
+                .get(cold_water_source.as_str())
+                .unwrap()
+                .clone();
             let wwhrs_instance: Option<Arc<Mutex<WwhrsInstantaneous>>> = wwhrs_config
                 .as_ref()
                 .map(|config| &config.waste_water_heat_recovery_system)
@@ -942,7 +930,10 @@ fn shower_from_input(
             energy_supply,
             rated_power,
         } => {
-            let cold_water_source = cold_water_sources.get(cold_water_source).unwrap().clone();
+            let cold_water_source = cold_water_sources
+                .get(cold_water_source.as_str())
+                .unwrap()
+                .clone();
 
             let energy_supply = energy_supplies
                 .get(energy_supply)
@@ -963,7 +954,7 @@ fn shower_from_input(
 
 fn input_to_bath(input: &BathDetails, cold_water_sources: &ColdWaterSources) -> Bath {
     let cold_water_source = cold_water_sources
-        .get(&input.cold_water_source)
+        .get(input.cold_water_source.as_str())
         .unwrap()
         .clone();
 
@@ -975,7 +966,7 @@ fn input_to_other_water_events(
     cold_water_sources: &ColdWaterSources,
 ) -> OtherHotWater {
     let cold_water_source = cold_water_sources
-        .get(&input.cold_water_source)
+        .get(input.cold_water_source.as_str())
         .unwrap()
         .clone();
 
@@ -1000,7 +991,7 @@ fn input_to_water_distribution_pipework(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::compare_floats::max_of_2;
     use crate::core::common::WaterSupply;
@@ -1012,12 +1003,103 @@ mod tests {
     };
     use crate::simulation_time::SimulationTime;
     use approx::assert_relative_eq;
+    use fsum::FSum;
     use parking_lot::RwLock;
     use pretty_assertions::assert_eq;
     use rstest::*;
 
+    #[derive(Clone, Debug)]
+    pub enum HotWaterSourceMockKind {
+        Simple(HotWaterSourceMock),
+        WithUniqueHotWaterTemperature(HotWaterSourceMockWithUniqueHotWaterTemperature),
+        WithInternalGains(HotWaterSourceMockWithInternalGains),
+    }
+
+    impl HotWaterSourceBehaviour for HotWaterSourceMockKind {
+        fn get_cold_water_source(&self) -> WaterSupply {
+            match self {
+                HotWaterSourceMockKind::Simple(mock) => mock.get_cold_water_source(),
+                HotWaterSourceMockKind::WithUniqueHotWaterTemperature(mock) => {
+                    mock.get_cold_water_source()
+                }
+                HotWaterSourceMockKind::WithInternalGains(mock) => mock.get_cold_water_source(),
+            }
+        }
+
+        fn demand_hot_water(
+            &self,
+            usage_events: Vec<WaterEventResult>,
+            simtime: SimulationTimeIteration,
+        ) -> anyhow::Result<f64> {
+            match self {
+                HotWaterSourceMockKind::Simple(mock) => {
+                    mock.demand_hot_water(usage_events, simtime)
+                }
+                HotWaterSourceMockKind::WithUniqueHotWaterTemperature(mock) => {
+                    mock.demand_hot_water(usage_events, simtime)
+                }
+                HotWaterSourceMockKind::WithInternalGains(mock) => {
+                    mock.demand_hot_water(usage_events, simtime)
+                }
+            }
+        }
+
+        fn get_temp_hot_water(
+            &self,
+            volume_required: f64,
+            volume_required_already: f64,
+            simtime: SimulationTimeIteration,
+        ) -> anyhow::Result<Vec<(f64, f64)>> {
+            match self {
+                HotWaterSourceMockKind::Simple(mock) => {
+                    mock.get_temp_hot_water(volume_required, volume_required_already, simtime)
+                }
+                HotWaterSourceMockKind::WithUniqueHotWaterTemperature(mock) => {
+                    mock.get_temp_hot_water(volume_required, volume_required_already, simtime)
+                }
+                HotWaterSourceMockKind::WithInternalGains(mock) => {
+                    mock.get_temp_hot_water(volume_required, volume_required_already, simtime)
+                }
+            }
+        }
+
+        fn internal_gains(&self) -> Option<f64> {
+            match self {
+                HotWaterSourceMockKind::Simple(mock) => mock.internal_gains(),
+                HotWaterSourceMockKind::WithUniqueHotWaterTemperature(mock) => {
+                    mock.internal_gains()
+                }
+                HotWaterSourceMockKind::WithInternalGains(mock) => mock.internal_gains(),
+            }
+        }
+
+        fn get_losses_from_primary_pipework_and_storage(&self) -> (f64, f64) {
+            match self {
+                HotWaterSourceMockKind::Simple(mock) => {
+                    mock.get_losses_from_primary_pipework_and_storage()
+                }
+                HotWaterSourceMockKind::WithUniqueHotWaterTemperature(mock) => {
+                    mock.get_losses_from_primary_pipework_and_storage()
+                }
+                HotWaterSourceMockKind::WithInternalGains(mock) => {
+                    mock.get_losses_from_primary_pipework_and_storage()
+                }
+            }
+        }
+
+        fn is_point_of_use(&self) -> bool {
+            match self {
+                HotWaterSourceMockKind::Simple(mock) => mock.is_point_of_use(),
+                HotWaterSourceMockKind::WithUniqueHotWaterTemperature(mock) => {
+                    mock.is_point_of_use()
+                }
+                HotWaterSourceMockKind::WithInternalGains(mock) => mock.is_point_of_use(),
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
-    struct HotWaterSourceMock {
+    pub struct HotWaterSourceMock {
         cold_feed: WaterSupply,
     }
 
@@ -1031,10 +1113,12 @@ mod tests {
             usage_events: Vec<WaterEventResult>,
             _: SimulationTimeIteration,
         ) -> anyhow::Result<f64> {
-            Ok(usage_events
-                .iter()
-                .map(|e| e.temperature_warm * e.volume_warm / 4200.0)
-                .sum())
+            Ok(FSum::with_all(
+                usage_events
+                    .iter()
+                    .map(|e| e.temperature_warm * e.volume_warm / 4200.0),
+            )
+            .value())
         }
 
         fn get_temp_hot_water(
@@ -1068,7 +1152,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
-    struct HotWaterSourceMockWithUniqueHotWaterTemperature {}
+    pub struct HotWaterSourceMockWithUniqueHotWaterTemperature {}
 
     impl HotWaterSourceBehaviour for HotWaterSourceMockWithUniqueHotWaterTemperature {
         fn get_cold_water_source(&self) -> WaterSupply {
@@ -1095,7 +1179,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
-    struct HotWaterSourceMockWithInternalGains {
+    pub struct HotWaterSourceMockWithInternalGains {
         cold_feed: WaterSupply,
     }
 
@@ -1109,10 +1193,12 @@ mod tests {
             usage_events: Vec<WaterEventResult>,
             _: SimulationTimeIteration,
         ) -> anyhow::Result<f64> {
-            Ok(usage_events
-                .iter()
-                .map(|e| e.temperature_warm * e.volume_warm / 4200.0)
-                .sum())
+            Ok(FSum::with_all(
+                usage_events
+                    .iter()
+                    .map(|e| e.temperature_warm * e.volume_warm / 4200.0),
+            )
+            .value())
         }
 
         fn get_temp_hot_water(
@@ -1270,13 +1356,13 @@ mod tests {
         ]
     }
 
-    fn create_dhw_demand<T: HotWaterSourceBehaviour>(
+    fn create_dhw_demand(
         simulation_time: SimulationTime,
-        hot_water_sources: IndexMap<Arc<str>, T>,
-        pre_heated_water_sources: IndexMap<String, T>,
-        cold_water_source: Arc<ColdWaterSource>,
+        hot_water_sources: IndexMap<Arc<str>, HotWaterSource>,
+        pre_heated_water_sources: IndexMap<String, HotWaterStorageTank>,
+        cold_water_source: &Arc<ColdWaterSource>,
         event_schedules: Vec<Option<Vec<TypedScheduleEvent>>>,
-    ) -> DomesticHotWaterDemand<T> {
+    ) -> DomesticHotWaterDemand {
         let flow_rates = vec![5., 7., 9., 11., 13.];
         let system_a_efficiencies = vec![44.8, 39.1, 34.8, 31.4, 28.6];
         let system_a_utilisation_factor = 0.7;
@@ -1285,7 +1371,7 @@ mod tests {
         let wwhrsb = Arc::new(Mutex::new(
             WwhrsInstantaneous::new(
                 flow_rates,
-                system_a_efficiencies,
+                system_a_efficiencies.into(),
                 cold_water_source.clone(),
                 system_a_utilisation_factor.into(),
                 None,
@@ -1294,7 +1380,6 @@ mod tests {
                 None,
                 Some(0.81),
                 None,
-                simulation_time.iter().current_iteration(),
             )
             .unwrap(),
         ));
@@ -1419,21 +1504,19 @@ mod tests {
         event_schedules: Vec<Option<Vec<TypedScheduleEvent>>>,
         cold_water_source: Arc<ColdWaterSource>,
     ) {
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMockWithUniqueHotWaterTemperature> =
-            IndexMap::from([(
-                "hw cylinder".into(),
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
+            "hw cylinder".into(),
+            HotWaterSource::Mock(HotWaterSourceMockKind::WithUniqueHotWaterTemperature(
                 HotWaterSourceMockWithUniqueHotWaterTemperature {},
-            )]);
-        let pre_heated_water_sources: IndexMap<
-            String,
-            HotWaterSourceMockWithUniqueHotWaterTemperature,
-        > = Default::default();
+            )),
+        )]);
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::default();
 
         let dhw_demand = create_dhw_demand(
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules,
         );
 
@@ -1505,12 +1588,14 @@ mod tests {
                                 temperature_warm: 41.,
                                 volume_warm: 20.378383818053738,
                                 volume_hot: 0.,
+                                event_duration: 6.0,
                             },
                             WaterEventResult {
                                 event_result_type: WaterEventResultType::Shower,
                                 temperature_warm: 41.,
                                 volume_warm: 20.378383818053738,
                                 volume_hot: 0.,
+                                event_duration: 6.0,
                             },
                         ],
                     ),
@@ -1549,6 +1634,7 @@ mod tests {
                             temperature_warm: 41.,
                             volume_warm: 19.85586115605236,
                             volume_hot: 0.,
+                            event_duration: 6.,
                         }],
                     ),
                     (
@@ -1559,12 +1645,14 @@ mod tests {
                                 temperature_warm: 41.,
                                 volume_warm: 100.,
                                 volume_hot: 73.58490566037736,
+                                event_duration: 12.5,
                             },
                             WaterEventResult {
                                 event_result_type: WaterEventResultType::PipeFlush,
                                 temperature_warm: 55.,
                                 volume_warm: 7.556577529434648,
                                 volume_hot: 7.556577529434648,
+                                event_duration: 0.,
                             },
                         ],
                     ),
@@ -1594,24 +1682,28 @@ mod tests {
                                 temperature_warm: 41.,
                                 volume_warm: 48.,
                                 volume_hot: 32.63058513558019,
+                                event_duration: 0.,
                             },
                             WaterEventResult {
                                 event_result_type: WaterEventResultType::PipeFlush,
                                 temperature_warm: 55.,
                                 volume_warm: 7.556577529434648,
                                 volume_hot: 7.556577529434648,
+                                event_duration: 0.,
                             },
                             WaterEventResult {
                                 event_result_type: WaterEventResultType::PipeFlush,
                                 temperature_warm: 41.,
                                 volume_warm: 8.,
                                 volume_hot: 5.846153846153845,
+                                event_duration: 0.,
                             },
                             WaterEventResult {
                                 event_result_type: WaterEventResultType::PipeFlush,
                                 temperature_warm: 55.,
                                 volume_warm: 7.556577529434648,
                                 volume_hot: 7.556577529434648,
+                                event_duration: 0.,
                             },
                         ],
                     ),
@@ -1641,24 +1733,28 @@ mod tests {
                                 temperature_warm: 41.,
                                 volume_warm: 48.,
                                 volume_hot: 32.365493807269814,
+                                event_duration: 0.,
                             },
                             WaterEventResult {
                                 event_result_type: WaterEventResultType::PipeFlush,
                                 temperature_warm: 55.,
                                 volume_warm: 7.556577529434648,
                                 volume_hot: 7.556577529434648,
+                                event_duration: 0.,
                             },
                             WaterEventResult {
                                 event_result_type: WaterEventResultType::Bath,
                                 temperature_warm: 55.,
                                 volume_warm: 24.,
                                 volume_hot: 17.41176470588235,
+                                event_duration: 0.,
                             },
                             WaterEventResult {
                                 event_result_type: WaterEventResultType::PipeFlush,
                                 temperature_warm: 54.99999999999999,
                                 volume_warm: 7.556577529434648,
                                 volume_hot: 7.556577529434648,
+                                event_duration: 0.,
                             },
                         ],
                     ),
@@ -1885,22 +1981,20 @@ mod tests {
             },
         ]);
 
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMockWithUniqueHotWaterTemperature> =
-            IndexMap::from([(
-                "hw cylinder".into(),
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
+            "hw cylinder".into(),
+            HotWaterSource::Mock(HotWaterSourceMockKind::WithUniqueHotWaterTemperature(
                 HotWaterSourceMockWithUniqueHotWaterTemperature {},
-            )]);
+            )),
+        )]);
 
-        let pre_heated_water_sources: IndexMap<
-            String,
-            HotWaterSourceMockWithUniqueHotWaterTemperature,
-        > = Default::default();
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::default();
 
         let dhw_demand = create_dhw_demand(
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules_modified,
         );
 
@@ -1963,18 +2057,20 @@ mod tests {
         event_schedules: Vec<Option<Vec<TypedScheduleEvent>>>,
         cold_water_source: Arc<ColdWaterSource>,
     ) {
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMock> = IndexMap::from([(
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
             "hw cylinder".into(),
-            HotWaterSourceMock {
+            HotWaterSource::Mock(HotWaterSourceMockKind::Simple(HotWaterSourceMock {
                 cold_feed: WaterSupply::ColdWaterSource(cold_water_source.clone()),
-            },
+            })),
         )]);
 
-        let pre_heated_water_sources: IndexMap<String, HotWaterSourceMock> = IndexMap::from([(
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::from([(
             "pre-heat tank".into(),
-            HotWaterSourceMock {
-                cold_feed: WaterSupply::ColdWaterSource(cold_water_source.clone()),
-            },
+            HotWaterStorageTank::Mock(Box::new(HotWaterSourceMockKind::Simple(
+                HotWaterSourceMock {
+                    cold_feed: WaterSupply::ColdWaterSource(cold_water_source.clone()),
+                },
+            ))),
         )]);
 
         let temp_int_air = 20.;
@@ -1984,7 +2080,7 @@ mod tests {
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules,
         );
 
@@ -2366,7 +2462,7 @@ mod tests {
                 // don't check for _electric_showers entry for the below
                 if key.as_ref() == "_electric_showers" {
                     continue;
-                };
+                }
                 assert_eq!(
                     *hw_energy_demand_incl_pipework_loss.get(&key).unwrap(),
                     hw_energy_demand_incl_pipework_loss_expected
@@ -2395,16 +2491,16 @@ mod tests {
         event_schedules: Vec<Option<Vec<TypedScheduleEvent>>>,
         cold_water_source: Arc<ColdWaterSource>,
     ) {
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMockWithInternalGains> =
-            IndexMap::from([(
-                "hw cylinder".into(),
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
+            "hw cylinder".into(),
+            HotWaterSource::Mock(HotWaterSourceMockKind::WithInternalGains(
                 HotWaterSourceMockWithInternalGains {
                     cold_feed: WaterSupply::ColdWaterSource(cold_water_source.clone()),
                 },
-            )]);
+            )),
+        )]);
 
-        let pre_heated_water_sources: IndexMap<String, HotWaterSourceMockWithInternalGains> =
-            IndexMap::from([]);
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::from([]);
 
         let temp_int_air = 20.;
         let temp_ext_air = 5.;
@@ -2413,7 +2509,7 @@ mod tests {
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules,
         );
 
@@ -2824,22 +2920,22 @@ mod tests {
         event_schedules: Vec<Option<Vec<TypedScheduleEvent>>>,
         cold_water_source: Arc<ColdWaterSource>,
     ) {
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMockWithInternalGains> =
-            IndexMap::from([(
-                "hw cylinder".into(),
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
+            "hw cylinder".into(),
+            HotWaterSource::Mock(HotWaterSourceMockKind::WithInternalGains(
                 HotWaterSourceMockWithInternalGains {
                     cold_feed: WaterSupply::ColdWaterSource(cold_water_source.clone()),
                 },
-            )]);
+            )),
+        )]);
 
-        let pre_heated_water_sources: IndexMap<String, HotWaterSourceMockWithInternalGains> =
-            IndexMap::from([]);
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::from([]);
 
         let dhw_demand = create_dhw_demand(
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules,
         );
 
@@ -2895,22 +2991,22 @@ mod tests {
         event_schedules: Vec<Option<Vec<TypedScheduleEvent>>>,
         cold_water_source: Arc<ColdWaterSource>,
     ) {
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMockWithInternalGains> =
-            IndexMap::from([(
-                "hw cylinder".into(),
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
+            "hw cylinder".into(),
+            HotWaterSource::Mock(HotWaterSourceMockKind::WithInternalGains(
                 HotWaterSourceMockWithInternalGains {
                     cold_feed: WaterSupply::ColdWaterSource(cold_water_source.clone()),
                 },
-            )]);
+            )),
+        )]);
 
-        let pre_heated_water_sources: IndexMap<String, HotWaterSourceMockWithInternalGains> =
-            IndexMap::from([]);
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::from([]);
 
         let dhw_demand = create_dhw_demand(
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules,
         );
 
@@ -2959,22 +3055,20 @@ mod tests {
             None,
         ];
 
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMockWithUniqueHotWaterTemperature> =
-            IndexMap::from([(
-                "hw cylinder".into(),
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
+            "hw cylinder".into(),
+            HotWaterSource::Mock(HotWaterSourceMockKind::WithUniqueHotWaterTemperature(
                 HotWaterSourceMockWithUniqueHotWaterTemperature {},
-            )]);
+            )),
+        )]);
 
-        let pre_heated_water_sources: IndexMap<
-            String,
-            HotWaterSourceMockWithUniqueHotWaterTemperature,
-        > = IndexMap::from([]);
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::from([]);
 
         let dhw_demand = create_dhw_demand(
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules,
         );
 
@@ -3046,22 +3140,20 @@ mod tests {
             None,
         ];
 
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMockWithUniqueHotWaterTemperature> =
-            IndexMap::from([(
-                "hw cylinder".into(),
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
+            "hw cylinder".into(),
+            HotWaterSource::Mock(HotWaterSourceMockKind::WithUniqueHotWaterTemperature(
                 HotWaterSourceMockWithUniqueHotWaterTemperature {},
-            )]);
+            )),
+        )]);
 
-        let pre_heated_water_sources: IndexMap<
-            String,
-            HotWaterSourceMockWithUniqueHotWaterTemperature,
-        > = IndexMap::from([]);
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::from([]);
 
         let dhw_demand = create_dhw_demand(
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules,
         );
 
@@ -3145,22 +3237,20 @@ mod tests {
             None,
         ];
 
-        let hot_water_sources: IndexMap<Arc<str>, HotWaterSourceMockWithUniqueHotWaterTemperature> =
-            IndexMap::from([(
-                "hw cylinder".into(),
+        let hot_water_sources: IndexMap<Arc<str>, HotWaterSource> = IndexMap::from([(
+            "hw cylinder".into(),
+            HotWaterSource::Mock(HotWaterSourceMockKind::WithUniqueHotWaterTemperature(
                 HotWaterSourceMockWithUniqueHotWaterTemperature {},
-            )]);
+            )),
+        )]);
 
-        let pre_heated_water_sources: IndexMap<
-            String,
-            HotWaterSourceMockWithUniqueHotWaterTemperature,
-        > = IndexMap::from([]);
+        let pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> = IndexMap::from([]);
 
         let dhw_demand = create_dhw_demand(
             simulation_time,
             hot_water_sources,
             pre_heated_water_sources,
-            cold_water_source,
+            &cold_water_source,
             event_schedules,
         );
 

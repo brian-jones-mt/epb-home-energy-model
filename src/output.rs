@@ -2,44 +2,45 @@ use crate::corpus::{NumberOrDivisionByZero, ResultsAnnual, ResultsPerTimestep};
 use crate::{EnergySupplyStatKey, StringOrNumber};
 use indexmap::IndexMap;
 use itertools::Itertools;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_enum_str::{Deserialize_enum_str, Serialize_enum_str};
 use smartstring::alias::String;
+use std::borrow::Cow;
 use std::sync::Arc;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputStatic {
     /// Heat transfer coefficient (unit: W/K)
-    pub(crate) heat_transfer_coefficient: f64,
+    pub heat_transfer_coefficient: f64,
     /// Heat loss parameter (unit: W/m².K)
-    pub(crate) heat_loss_param: f64,
+    pub heat_loss_param: f64,
     /// Heat capacity parameter (unit: kJ/m².K)
-    pub(crate) heat_capacity_param: f64,
+    pub heat_capacity_param: f64,
     /// Heat loss form factor
-    pub(crate) heat_loss_form_factor: f64,
+    pub heat_loss_form_factor: f64,
     /// Internal air temperature (unit: ˚C)
-    pub(crate) temperature_air_internal: f64,
+    pub temperature_air_internal: f64,
     /// External air temperature (unit: ˚C)
-    pub(crate) temperature_air_external: f64,
+    pub temperature_air_external: f64,
 }
 
 /// Zone output data. Each field is keyed by zone name.
 /// These fields names are used in the core output file (substituting " " for "_")
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputZoneData {
     // NB: Field order is important as it affects the output files.
     /// Internal gains (unit: W)
-    pub(crate) internal_gains: IndexMap<Arc<str>, Vec<f64>>,
+    pub internal_gains: IndexMap<Arc<str>, Vec<f64>>,
     /// Solar gains (unit: W)
-    pub(crate) solar_gains: IndexMap<Arc<str>, Vec<f64>>,
+    pub solar_gains: IndexMap<Arc<str>, Vec<f64>>,
     /// Operative temperature (unit: ˚C)
-    pub(crate) operative_temp: IndexMap<Arc<str>, Vec<f64>>,
+    pub operative_temp: IndexMap<Arc<str>, Vec<f64>>,
     /// Internal air temperature (unit: ˚C)
-    pub(crate) internal_air_temp: IndexMap<Arc<str>, Vec<f64>>,
+    pub internal_air_temp: IndexMap<Arc<str>, Vec<f64>>,
     /// Space heat demand (unit: kWh)
-    pub(crate) space_heat_demand: IndexMap<Arc<str>, Vec<f64>>,
+    pub space_heat_demand: IndexMap<Arc<str>, Vec<f64>>,
     /// Space cool demand (unit: kWh)
-    pub(crate) space_cool_demand: IndexMap<Arc<str>, Vec<f64>>,
+    pub space_cool_demand: IndexMap<Arc<str>, Vec<f64>>,
 }
 
 impl OutputZoneData {
@@ -65,35 +66,35 @@ pub(crate) const OUTPUT_ZONE_DATA_FIELD_HEADINGS: &[&str] = &[
 ];
 
 /// Contains the output timeseries for the heating and cooling systems, respectively.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputHeatingCoolingSystem {
     /// Heating system output, for each heating system (unit: kWh)
-    pub(crate) heating_system_output: IndexMap<Option<Arc<str>>, Vec<f64>>,
+    pub heating_system_output: IndexMap<Option<Arc<str>>, Vec<f64>>,
     /// Cooling system output, keyed by cooling system name (unit: kWh)
-    pub(crate) cooling_system_output: IndexMap<Option<Arc<str>>, Vec<f64>>,
+    pub cooling_system_output: IndexMap<Option<Arc<str>>, Vec<f64>>,
 }
 
 /// Hot water systems data for every time step.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputHotWaterSystems {
     // NB: Field order is important as it affects the output files.
     // Each field's alias is the heading to use in the core output CSV.
     /// Hot water volume required from hot water source, for each hot water source (unit: litres)
-    pub(crate) demand: IndexMap<Arc<str>, Vec<f64>>,
+    pub demand: IndexMap<Arc<str>, Vec<f64>>,
     /// Hot water energy demand at hot water source, for each hot water source (unit: kWh)
-    pub(crate) energy_demand_at_hot_water_source: IndexMap<Arc<str>, Vec<f64>>,
+    pub energy_demand_at_hot_water_source: IndexMap<Arc<str>, Vec<f64>>,
     /// Hot water energy demand at connected tapping points, for each hot water source (unit: kWh)
-    pub(crate) energy_demand_at_tapping_points: IndexMap<Arc<str>, Vec<f64>>,
+    pub energy_demand_at_tapping_points: IndexMap<Arc<str>, Vec<f64>>,
     /// Total hot water event duration, for each hot water source (unit: minutes)
-    pub(crate) duration: IndexMap<Arc<str>, Vec<f64>>,
+    pub duration: IndexMap<Arc<str>, Vec<f64>>,
     /// Number of hot water events, for each hot water source (unit: count)
-    pub(crate) events_count: IndexMap<Arc<str>, Vec<f64>>,
+    pub events_count: IndexMap<Arc<str>, Vec<f64>>,
     /// Pipework losses, for each hot water source (unit: kWh)
-    pub(crate) losses_pipework: IndexMap<Arc<str>, Vec<f64>>,
+    pub losses_pipework: IndexMap<Arc<str>, Vec<f64>>,
     /// Primary pipework losses, for each hot water source (unit: kWh)
-    pub(crate) losses_primary_pipework: IndexMap<Arc<str>, Vec<f64>>,
+    pub losses_primary_pipework: IndexMap<Arc<str>, Vec<f64>>,
     /// Storage losses, for each hot water source (unit: kWh)
-    pub(crate) losses_storage: IndexMap<Arc<str>, Vec<f64>>,
+    pub losses_storage: IndexMap<Arc<str>, Vec<f64>>,
 }
 
 #[derive(Clone, Copy, Deserialize_enum_str, Debug, Eq, Hash, PartialEq, Serialize_enum_str)]
@@ -176,46 +177,46 @@ impl OutputHotWaterSystems {
 
 /// Coefficients of performance for space heating & cooling, and hot water systems.
 /// Null-values are used when a divide-by-zero occurs in the results. These are output as "DIV/0" in the CSVs.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputCop {
     /// Overall coefficient of performance for each heating system (unitless)
-    pub(crate) space_heating_system: IndexMap<Arc<str>, NumberOrDivisionByZero>,
+    pub space_heating_system: IndexMap<Arc<str>, NumberOrDivisionByZero>,
     /// Overall coefficient of performance for each heating system (unitless)
-    pub(crate) space_cooling_system: IndexMap<Arc<str>, NumberOrDivisionByZero>,
+    pub space_cooling_system: IndexMap<Arc<str>, NumberOrDivisionByZero>,
     /// Overall coefficient of performance for each heating system (unitless)
-    pub(crate) hot_water_system: IndexMap<Arc<str>, NumberOrDivisionByZero>,
+    pub hot_water_system: IndexMap<Arc<str>, NumberOrDivisionByZero>,
 }
 
 /// Emitters data for every time step.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct OutputEmitters {
     /// Current time step
-    pub(crate) simulation_time_idx: usize,
+    pub simulation_time_idx: usize,
     /// Energy demand (unit: kWh)
-    pub(crate) energy_demand: f64,
+    pub energy_demand: f64,
     /// Required emitter temperature to satisfy zone setpoint (unit: Celsius)
-    pub(crate) temp_emitter_required: f64,
+    pub temp_emitter_required: f64,
     /// Time at which the emitter begins operating
-    pub(crate) time_heating_start: f64,
+    pub time_heating_start: f64,
     /// Energy provided by heat source (unit: kWh)
-    pub(crate) energy_provided_by_heat_source: f64,
+    pub energy_provided_by_heat_source: f64,
     /// Temperature of the emitter (unit: Celsius)
-    pub(crate) temp_emitter: StringOrNumber,
+    pub temp_emitter: StringOrNumber,
     /// Maximum temperature the emitter can safely reach (unit: Celsius)
-    pub(crate) temp_emitter_max: f64,
+    pub temp_emitter_max: f64,
     /// Energy released from emitters (unit: kWh)
-    pub(crate) energy_released_from_emitters: f64,
+    pub energy_released_from_emitters: f64,
     /// Desired supply temperature to the emitter (unit: Celsius)
-    pub(crate) temp_flow_target: f64,
+    pub temp_flow_target: f64,
     /// Desired return temperature from the emitter (unit: Celsius)
-    pub(crate) temp_return_target: f64,
+    pub temp_return_target: f64,
     /// Whether the maximum emitter temperature is used as the final supply temperature
-    pub(crate) temp_emitter_max_is_final_temp: bool,
+    pub temp_emitter_max_is_final_temp: bool,
     /// Energy required from the heat source (unit: kWh)
-    pub(crate) energy_required_from_heat_source: f64,
+    pub energy_required_from_heat_source: f64,
     /// Fan electricity consumption (unit: kWh)
     #[serde(rename = "fan_energy_kWh")]
-    pub(crate) fan_energy_kwh: f64,
+    pub fan_energy_kwh: f64,
 }
 
 /// The raw HEM Core outputs, from Corpus::run()
@@ -225,147 +226,147 @@ pub struct OutputEmitters {
 ///       - water heating unmet demand, where the naming convention is _unmet_demand: [hot water source names from input]
 ///
 /// For all other energy supplies, end-use names refer to specific systems or appliances specified in the input file.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputCore {
     /// The list of timesteps, serves as an index for the other outputs (unit: Hours)
-    pub(crate) timestep_array: Vec<f64>,
+    pub timestep_array: Vec<f64>,
     /// Total energy (unit: kWh)
-    pub(crate) results_totals: IndexMap<Arc<str>, Vec<f64>>,
+    pub results_totals: IndexMap<Arc<str>, Vec<f64>>,
     /// Energy per supply, per end use (unit: kWh)
-    pub(crate) results_end_user: IndexMap<Arc<str>, IndexMap<Arc<str>, Vec<f64>>>,
-    /// Energy import (unit: kWh)
-    pub(crate) energy_import: IndexMap<Arc<str>, Vec<f64>>,
-    /// Energy export (unit: kWh)
-    pub(crate) energy_export: IndexMap<Arc<str>, Vec<f64>>,
-    /// Energy from grid to consumption (unit: kWh)
-    pub(crate) grid_to_consumption: IndexMap<Arc<str>, Vec<f64>>,
-    /// Energy export from generation (unit: kWh)
-    pub(crate) generation_to_grid: IndexMap<Arc<str>, Vec<f64>>,
-    /// Energy generated and consumed (unit: kWh)
-    pub(crate) energy_generated_consumed: IndexMap<Arc<str>, Vec<f64>>,
-    /// Energy to storage (unit: kWh)
-    pub(crate) energy_to_storage: IndexMap<Arc<str>, Vec<f64>>,
-    /// Energy from storage (unit: kWh)
-    pub(crate) energy_from_storage: IndexMap<Arc<str>, Vec<f64>>,
-    /// Imported energy to storage, (unit: kWh)
-    pub(crate) storage_from_grid: IndexMap<Arc<str>, Vec<f64>>,
-    /// Battery charge level (unit: ratio 0 to 1 as a percentage)
-    pub(crate) battery_state_of_charge: IndexMap<Arc<str>, Vec<f64>>,
-    /// Energy diverted (unit: kWh)
-    pub(crate) energy_diverted: IndexMap<Arc<str>, Vec<f64>>,
-    /// Energy supply beta factor (unit: ratio 0 to 1)
-    pub(crate) beta_factor: IndexMap<Arc<str>, Vec<f64>>,
+    pub results_end_user: IndexMap<Arc<str>, IndexMap<Arc<str>, Vec<f64>>>,
+    /// Total energy imported from the grid, including both direct consumption and battery charging (unit: kWh)
+    pub energy_import: IndexMap<Arc<str>, Vec<f64>>,
+    /// Total energy exported to the grid (unit: kWh)
+    pub energy_export: IndexMap<Arc<str>, Vec<f64>>,
+    /// Energy imported from the grid directly to consumption. Does not include grid to battery charging (unit: kWh)
+    pub grid_to_consumption: IndexMap<Arc<str>, Vec<f64>>,
+    /// On-site generation immediately exported to the grid (unit: kWh)
+    pub generation_to_grid: IndexMap<Arc<str>, Vec<f64>>,
+    /// On-site generation immediately consumed within the dwelling. Does not include energy via storage or PV diverter (unit: kWh)
+    pub energy_generated_consumed: IndexMap<Arc<str>, Vec<f64>>,
+    /// Energy from on-site generation to storage. Does not include energy from the grid to storage (unit: kWh)
+    pub energy_to_storage: IndexMap<Arc<str>, Vec<f64>>,
+    /// Energy discharged from storage to consumption (unit: kWh)
+    pub energy_from_storage: IndexMap<Arc<str>, Vec<f64>>,
+    /// Energy imported from the grid to storage. Does not include energy from on-site generation to storage (unit: kWh)
+    pub storage_from_grid: IndexMap<Arc<str>, Vec<f64>>,
+    /// Battery charge level (unit: ratio 0 to 1)
+    pub battery_state_of_charge: IndexMap<Arc<str>, Vec<f64>>,
+    /// Surplus on-site generation diverted to PV diverter, e.g. immersion heater (unit: kWh)
+    pub energy_diverted: IndexMap<Arc<str>, Vec<f64>>,
+    /// Fraction of on-site generation immediately consumed within the dwelling. Does not include energy to storage or diverters (unit: ratio 0 to 1)
+    pub beta_factor: IndexMap<Arc<str>, Vec<f64>>,
     /// List of the unique zone names in the zone data
-    pub(crate) zone_list: Vec<Arc<str>>,
-    pub(crate) zone_data: OutputZoneData,
-    pub(crate) heating_cooling_system: OutputHeatingCoolingSystem,
-    pub(crate) cop: OutputCop,
-    /// Ventilation ductwork gains (unit: kWh)
-    pub(crate) ductwork_gains: Vec<f64>,
+    pub zone_list: Vec<Arc<str>>,
+    pub zone_data: OutputZoneData,
+    pub heating_cooling_system: OutputHeatingCoolingSystem,
+    pub cop: OutputCop,
+    /// Ventilation ductwork gains (unit: W)
+    pub ductwork_gains: Vec<f64>,
     /// Heat balance data for each zone.
-    pub(crate) heat_balance_all: OutputHeatBalanceAll,
+    pub heat_balance_all: OutputHeatBalanceAll,
     /// Heat source wet detailed results.
-    pub(crate) heat_source_wet_results: IndexMap<Arc<str>, ResultsPerTimestep>,
+    pub heat_source_wet_results: IndexMap<Arc<str>, ResultsPerTimestep>,
     /// Annual heat source wet detailed results.
-    pub(crate) heat_source_wet_results_annual: IndexMap<Arc<str>, ResultsAnnual>,
-    /// Hot water source results summary.
+    pub heat_source_wet_results_annual: IndexMap<Arc<str>, ResultsAnnual>,
+    /// Hot water source results.
     /// Currently unstructured, see CSV for column-order.
-    pub(crate) hot_water_source_results_summary: IndexMap<Arc<str>, Vec<Vec<StringOrNumber>>>,
+    pub hot_water_source_results: IndexMap<Arc<str>, Vec<Vec<StringOrNumber>>>,
     /// Heating system emitters detailed outputs.
     /// Currently unstructured, see CSV for column-order.
-    pub(crate) emitters: IndexMap<Arc<str>, IndexMap<usize, OutputEmitters>>,
+    pub emitters: IndexMap<Arc<str>, IndexMap<usize, OutputEmitters>>,
     /// Electric storage heaters detailed outputs.
     /// Currently unstructured, see CSV for column-order.
-    pub(crate) electric_storage_heaters: IndexMap<Arc<str>, IndexMap<usize, Vec<f64>>>,
+    pub electric_storage_heaters: IndexMap<Arc<str>, IndexMap<usize, Vec<f64>>>,
     /// Ventilation detailed outputs.
     /// Currently unstructured, see CSV for column-order.
-    pub(crate) ventilation: Vec<Vec<StringOrNumber>>,
-    pub(crate) hot_water_systems: OutputHotWaterSystems,
+    pub ventilation: Vec<Vec<StringOrNumber>>,
+    pub hot_water_systems: OutputHotWaterSystems,
 }
 
 pub(crate) type OutputHeatBalanceAll =
     IndexMap<Arc<str>, IndexMap<Arc<str>, IndexMap<Arc<str>, Vec<f64>>>>;
 
 /// Details of the time-step with the peak electricity consumption within the simulation.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputSummaryPeakElectricityConsumption {
     /// The maximum electricity consumption (unit: kWh)
-    pub(crate) peak: f64,
+    pub peak: f64,
     /// The time step the peak occurred at
-    pub(crate) index: usize,
-    /// The month the peak occurred in
-    pub(crate) month: u8,
+    pub index: usize,
+    /// The month the peak occurred in (1=January, 12=December)
+    pub month: u8,
     /// The day of the month the peak occurred on
-    pub(crate) day: u8,
+    pub day: u8,
     /// The hour of the day the peak occurred on. Decimal-time is used if the simulation step is less than 1 hour.
-    pub(crate) hour: u8,
+    pub hour: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputSummaryEnergySupply {
     /// All energy generated on site (unit: kWh)
-    pub(crate) electricity_generated: f64,
+    pub generation: f64,
     /// All energy consumed for space and water heating, appliances and cooking (unit: kWh)
-    pub(crate) electricity_consumed: f64,
-    /// Total energy generated and consumed immediately, excluding PV diverter (unit: kWh)
-    pub(crate) generation_to_consumption: f64,
-    /// Total energy exported to grid immediately from generation (unit: kWh)
-    pub(crate) generation_to_grid: f64,
-    /// Total energy generated and sent to PV diverter (unit: kWh)
-    pub(crate) generation_to_diverter: f64,
-    /// Total energy imported from the grid (unit: kWh)
-    pub(crate) grid_to_consumption: f64,
-    /// Total energy imported and put into storage (unit: kWh)
-    pub(crate) grid_to_storage: f64,
-    /// Total energy generated and put into storage (unit: kWh)
-    pub(crate) generation_to_storage: f64,
-    /// Total energy consumed from storage (unit: kWh)
-    pub(crate) storage_to_consumption: f64,
-    /// Storage round-trip efficiency.
-    /// Total energy consumed from storage divided by total energy put into storage, from both grid and on site generation.
-    /// (unit: kWh)
-    pub(crate) storage_efficiency: f64,
-    /// Net import grid to consumption minus generation to grid (unit: kWh)
-    pub(crate) net_import: f64,
-    /// Gross import from grid (unit: kWh)
-    pub(crate) total_gross_import: f64,
-    /// Gross export to grid (unit: kWh)
-    pub(crate) total_gross_export: f64,
+    pub consumption: f64,
+    /// Total on-site generation immediately consumed within the dwelling. Does not include energy via storage or PV diverter (unit: kWh)
+    pub generation_to_consumption: f64,
+    /// Total on-site generation immediately exported to the grid (unit: kWh)
+    pub generation_to_grid: f64,
+    /// Total surplus on-site generation diverted to PV diverter, e.g. immersion heater (unit: kWh)
+    pub generation_to_diverter: f64,
+    /// Total energy imported from the grid directly to consumption. Does not include grid to battery charging (unit: kWh)
+    pub grid_to_consumption: f64,
+    /// Total energy imported from the grid to storage. Does not include on-site generation to storage (unit: kWh)
+    pub grid_to_storage: f64,
+    /// Total on-site generation put into storage. Does not include energy from the grid to storage (unit: kWh)
+    pub generation_to_storage: f64,
+    /// Total energy discharged from storage to consumption (unit: kWh)
+    pub storage_to_consumption: f64,
+    /// Storage round-trip efficiency: total energy discharged from storage divided by total energy put into storage from both grid and on-site generation (unit: kWh)
+    pub storage_efficiency: Option<f64>,
+    /// Net import: total gross import minus total gross export (unit: kWh)
+    pub net_import: f64,
+    /// Total energy imported from the grid, including both direct consumption and battery charging (unit: kWh)
+    pub total_gross_import: f64,
+    /// Total energy exported to the grid (unit: kWh)
+    pub total_gross_export: f64,
 }
 
 impl OutputSummaryEnergySupply {
-    pub(crate) fn field(&self, key: &EnergySupplyStatKey) -> f64 {
+    pub(crate) fn field(&self, key: &EnergySupplyStatKey) -> Option<f64> {
         match key {
-            EnergySupplyStatKey::ElectricityGenerated => self.electricity_generated,
-            EnergySupplyStatKey::ElectricityConsumed => self.electricity_consumed,
-            EnergySupplyStatKey::GenerationToConsumption => self.generation_to_consumption,
-            EnergySupplyStatKey::GridToConsumption => self.grid_to_consumption,
-            EnergySupplyStatKey::GenerationToGrid => self.generation_to_grid,
-            EnergySupplyStatKey::NetImport => self.net_import,
-            EnergySupplyStatKey::GenerationToStorage => self.generation_to_storage,
-            EnergySupplyStatKey::StorageToConsumption => self.storage_to_consumption,
-            EnergySupplyStatKey::StorageFromGrid => self.grid_to_storage,
-            EnergySupplyStatKey::GenerationToDiverter => self.generation_to_diverter,
+            EnergySupplyStatKey::Generation => self.generation.into(),
+            EnergySupplyStatKey::Consumption => self.consumption.into(),
+            EnergySupplyStatKey::GenerationToConsumption => self.generation_to_consumption.into(),
+            EnergySupplyStatKey::GridToConsumption => self.grid_to_consumption.into(),
+            EnergySupplyStatKey::TotalGrossImport => self.total_gross_import.into(),
+            EnergySupplyStatKey::TotalGrossExport => self.total_gross_export.into(),
+            EnergySupplyStatKey::GenerationToGrid => self.generation_to_grid.into(),
+            EnergySupplyStatKey::NetImport => self.net_import.into(),
+            EnergySupplyStatKey::GenerationToStorage => self.generation_to_storage.into(),
+            EnergySupplyStatKey::StorageToConsumption => self.storage_to_consumption.into(),
+            EnergySupplyStatKey::StorageFromGrid => self.grid_to_storage.into(),
+            EnergySupplyStatKey::GenerationToDiverter => self.generation_to_diverter.into(),
             EnergySupplyStatKey::StorageEfficiency => self.storage_efficiency,
         }
     }
 }
 
 /// Summary outputs from HEM Core.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputSummary {
     /// Total floor-area of all zones (unit: m²)
-    pub(crate) total_floor_area: f64,
+    pub total_floor_area: f64,
     /// Space heating demand total (unit: kWh)
-    pub(crate) space_heat_demand_total: f64,
+    pub space_heat_demand_total: f64,
     /// Space cooling demand total (unit: kWh)
-    pub(crate) space_cool_demand_total: f64,
-    pub(crate) electricity_peak_consumption: OutputSummaryPeakElectricityConsumption,
-    pub(crate) energy_supply: IndexMap<Arc<str>, OutputSummaryEnergySupply>,
+    pub space_cool_demand_total: f64,
+    pub electricity_peak_consumption: OutputSummaryPeakElectricityConsumption,
+    pub energy_supply: IndexMap<Arc<str>, OutputSummaryEnergySupply>,
     /// Delivered energy summary, total energy per fuel and end-use (unit: kWh)
-    pub(crate) delivered_energy: IndexMap<Arc<str>, IndexMap<Arc<str>, f64>>,
+    pub delivered_energy: IndexMap<Arc<str>, IndexMap<Arc<str>, f64>>,
     /// 75th percentile of hot water demand summed over each 24 hour segment of the simulation.
-    pub(crate) hot_water_demand_daily_75th_percentile: IndexMap<Arc<str>, f64>,
+    pub hot_water_demand_daily_75th_percentile: IndexMap<Arc<str>, f64>,
 }
 
 impl OutputSummary {
@@ -395,20 +396,24 @@ impl OutputSummary {
             })
             .collect()
     }
+
+    pub fn delivered_energy(&self) -> &IndexMap<Arc<str>, IndexMap<Arc<str>, f64>> {
+        &self.delivered_energy
+    }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OutputMetadata {
-    pub(crate) hem_core_version: &'static str, // we'd expect this to always be statically available
+    pub(crate) hem_core_version: Cow<'static, str>, // deserialization doesn't like the static lifetime, so using a cow here
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Output {
     #[serde(rename = "static")]
-    pub(crate) static_: OutputStatic,
-    pub(crate) core: OutputCore,
-    pub(crate) summary: OutputSummary,
-    pub(crate) metadata: OutputMetadata,
+    pub static_: OutputStatic,
+    pub core: OutputCore,
+    pub summary: OutputSummary,
+    pub metadata: OutputMetadata,
 }
 
 #[cfg(test)]
@@ -428,7 +433,7 @@ mod tests {
                 index: 0,
                 month: 0,
                 day: 0,
-                hour: 0,
+                hour: 0.0,
             },
             energy_supply: Default::default(),
             delivered_energy: Default::default(),

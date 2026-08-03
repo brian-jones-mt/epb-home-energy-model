@@ -45,10 +45,11 @@ use crate::core::schedule::{
     ScheduleEvent, TypedScheduleEvent, WaterScheduleEventType,
 };
 use crate::core::space_heat_demand::building_element::{
-    convert_uvalue_to_resistance, BuildingElement, BuildingElementAdjacentConditionedSpace,
-    BuildingElementAdjacentUnconditionedSpaceSimple, BuildingElementGround, BuildingElementOpaque,
-    BuildingElementTransparent, WindowTreatment, H_CE, H_RE, PITCH_LIMIT_HORIZ_CEILING,
-    PITCH_LIMIT_HORIZ_FLOOR, R_SI_DOWNWARDS, R_SI_HORIZONTAL, R_SI_UPWARDS,
+    calculate_cavity_resistance, convert_uvalue_to_resistance, BuildingElement,
+    BuildingElementAdjacentConditionedSpace, BuildingElementAdjacentUnconditionedSpaceSimple,
+    BuildingElementGround, BuildingElementOpaque, BuildingElementPartyWall,
+    BuildingElementTransparent, WindowTreatment, H_CE, H_RE, R_SI_DOWNWARDS, R_SI_HORIZONTAL,
+    R_SI_UPWARDS,
 };
 use crate::core::space_heat_demand::internal_gains::{
     ApplianceGains, EventApplianceGains, Gains, InternalGains,
@@ -61,8 +62,13 @@ use crate::core::space_heat_demand::zone::{
     calc_vent_heat_transfer_coeff, AirChangesPerHourArgument, HeatBalance, HeatBalanceFieldName,
     Zone, ZoneTempInternalAir,
 };
-use crate::core::units::{kelvin_to_celsius, SECONDS_PER_HOUR, WATTS_PER_KILOWATT};
+use crate::core::units::{
+    kelvin_to_celsius, Orientation360, DAYS_PER_YEAR, HOURS_PER_DAY, SECONDS_PER_HOUR,
+    WATTS_PER_KILOWATT,
+};
 use crate::core::water_heat_demand::cold_water_source::ColdWaterSource;
+#[cfg(test)]
+use crate::core::water_heat_demand::dhw_demand::tests::HotWaterSourceMockKind;
 use crate::core::water_heat_demand::dhw_demand::ELECTRIC_SHOWERS_HWS_NAME;
 use crate::core::water_heat_demand::dhw_demand::{DomesticHotWaterDemand, WaterHeatingCalculation};
 use crate::core::water_heat_demand::misc::WaterEventResult;
@@ -72,12 +78,12 @@ use crate::input::{
     ApplianceGains as ApplianceGainsInput, ApplianceGainsDetails,
     BuildingElement as BuildingElementInput, BuildingElementHeightWidthInput, ChargeLevel,
     ColdWaterSourceDetails, ColdWaterSourceInput, Control as ControlInput, ControlCombinations,
-    ControlDetails, DuctType, EnergyDiverter, EnergySupplyDetails, EnergySupplyInput, FlowData,
-    FuelType, HeatBattery as HeatBatteryInput, HeatPumpSourceType, HeatSource as HeatSourceInput,
+    ControlDetails, EnergyDiverter, EnergySupplyDetails, EnergySupplyInput, FlowData, FuelType,
+    HeatBattery as HeatBatteryInput, HeatPumpSourceType, HeatSource as HeatSourceInput,
     HeatSourceControlType, HeatSourceWetDetails, HotWaterSourceDetails,
     InfiltrationVentilation as InfiltrationVentilationInput, Input, InputForCalcHtcHlp,
     InternalGains as InternalGainsInput, InternalGainsDetails,
-    OnSiteGeneration as OnSiteGenerationInput, PhotovoltaicInputs,
+    OnSiteGeneration as OnSiteGenerationInput, PartyWallCavityType, PhotovoltaicInputs,
     PhotovoltaicSystem as PhotovoltaicSystemInput,
     PhotovoltaicSystemWithPanels as PhotovoltaicSystemWithPanelsInput,
     SpaceCoolSystem as SpaceCoolSystemInput, SpaceCoolSystemDetails,
@@ -85,7 +91,10 @@ use crate::input::{
     ThermalBridging as ThermalBridgingInput, ThermalBridgingDetails, UValueInput, VentilationLeaks,
     WasteWaterHeatRecovery, WasteWaterHeatRecoveryDetails, WaterHeatingEvent, WaterHeatingEvents,
     WaterPipework, WetEmitter, ZoneDictionary, ZoneInput, ZoneTemperatureControlBasis,
-    MAIN_REFERENCE,
+    MAIN_REFERENCE, PITCH_LIMIT_HORIZ_CEILING, PITCH_LIMIT_HORIZ_FLOOR,
+};
+use crate::input_dependency_resolvers::{
+    build_preheated_water_source_dependency_graph, topological_sort_preheated_water_sources,
 };
 use crate::output::{
     Output, OutputCop, OutputCore, OutputHeatingCoolingSystem, OutputHotWaterSystems, OutputStatic,
@@ -101,17 +110,17 @@ use anyhow::{anyhow, bail};
 use atomic_float::AtomicF64;
 use chrono::{prelude::*, TimeDelta};
 use erased_serde::__private::serde::Serializer;
-use indexmap::IndexMap;
+use fsum::FSum;
+use indexmap::{IndexMap, IndexSet};
 #[cfg(feature = "indicatif")]
-use indicatif::ProgressIterator;
+use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use parking_lot::{Mutex, RwLock};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_enum_str::{Deserialize_enum_str, Serialize_enum_str};
 use smartstring::alias::String;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
 use std::default::Default;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
@@ -140,7 +149,7 @@ fn control_from_input(
     simulation_time_iterator: &SimulationTimeIterator,
 ) -> anyhow::Result<Controls> {
     let mut core: Vec<HeatSourceControl> = Default::default();
-    let mut extra: HashMap<String, Arc<Control>> = Default::default();
+    let mut extra: IndexMap<String, Arc<Control>> = Default::default();
 
     // this is very ugly(!) but is just a reflection of the lack of clarity in the schema
     // and the way the variants-struct crate works;
@@ -278,7 +287,7 @@ fn single_control_from_details(
             Control::Charge(ChargeControl::new(
                 logic_type,
                 schedule,
-                &simulation_time_iterator.current_iteration(),
+                simulation_time_iterator,
                 *start_day,
                 *time_series_step,
                 charge_level_vec,
@@ -298,6 +307,7 @@ fn single_control_from_details(
             ..
         } => Control::OnOffMinimisingTime(OnOffCostMinimisingTimeControl::new(
             reject_nulls(expand_numeric_schedule(schedule))?,
+            simulation_time_iterator,
             *start_day,
             *time_series_step,
             *time_on_daily,
@@ -315,14 +325,14 @@ fn single_control_from_details(
             fn collect_controls(
                 control_combinations: &ControlCombinations,
                 current_key: &str,
-                visited: Option<&mut HashSet<String>>,
+                visited: Option<&mut IndexSet<String>>,
                 control_input: &ControlInput,
                 external_conditions: Arc<ExternalConditions>,
                 simulation_time_iterator: &SimulationTimeIterator,
             ) -> anyhow::Result<IndexMap<String, Arc<Control>>> {
-                let mut empty_set: HashSet<String> = Default::default();
+                let mut empty_set: IndexSet<String> = Default::default();
                 let visited = visited.unwrap_or(&mut empty_set);
-                let mut controls: HashSet<String> = Default::default();
+                let mut controls: IndexSet<String> = Default::default();
 
                 if visited.contains(current_key) {
                     bail!("Error: Circular reference detected involving '{current_key}' in CombinationTimeControl. Exiting program.")
@@ -471,6 +481,11 @@ fn init_resistance_or_uvalue(element: &BuildingElementInput) -> anyhow::Result<f
             u_value_input,
             ..
         } => params_from_u_value_input_and_pitch(u_value_input, *pitch),
+        BuildingElementInput::PartyWall {
+            pitch,
+            u_value_input,
+            ..
+        } => params_from_u_value_input_and_pitch(u_value_input, *pitch),
     };
     init_resistance_or_uvalue_from_data(thermal_resistance_construction, u_value, pitch)
 }
@@ -540,9 +555,21 @@ pub fn calc_htc_hlp<T: InputForCalcHtcHlp>(input: &T) -> anyhow::Result<HtcHlpCa
             BuildingElementInput::AdjacentConditionedSpace { .. } => 0.,
             BuildingElementInput::AdjacentUnconditionedSpace { area, .. } => {
                 let u_value = 1.0 / (thermal_resistance_construction + r_se + r_si);
-                area.ok_or_else(|| {
-                    anyhow!("AdjacentConditionedSpace building element is expected have an area")
-                })? * u_value
+                area * u_value
+            }
+            BuildingElementInput::PartyWall {
+                area,
+                party_wall_cavity_data,
+                ..
+            } => {
+                //Party wall calculations follow same approach as adjacent unconditioned space
+                let r_se = calculate_cavity_resistance(
+                    &PartyWallCavityType::from(*party_wall_cavity_data),
+                    party_wall_cavity_data.party_wall_lining_type().as_ref(),
+                    party_wall_cavity_data.thermal_resistance_cavity(),
+                )?;
+                let u_value = 1.0 / (thermal_resistance_construction + r_se + r_si);
+                area * u_value
             }
         })
     }
@@ -570,10 +597,8 @@ pub fn calc_htc_hlp<T: InputForCalcHtcHlp>(input: &T) -> anyhow::Result<HtcHlpCa
     }
 
     let calc_htc = |zone: &ZoneInput| -> anyhow::Result<(f64, f64, f64)> {
-        let wind_speed = external_conditions.wind_speed_annual().ok_or_else(|| {
-            anyhow!("Expected external conditions to contain data for entire year")
-        })?;
-        let wind_direction = external_conditions.wind_direction_annual();
+        let wind_speed = external_conditions.wind_speed_annual()?;
+        let wind_direction = external_conditions.wind_direction_annual()?;
         let temp_int_air = input.temp_internal_air_static_calcs();
         let temp_ext_air = external_conditions.air_temp_annual_daily_average_min();
         let ach_min = input.infiltration_ventilation().ach_min_static_calcs;
@@ -606,18 +631,19 @@ pub fn calc_htc_hlp<T: InputForCalcHtcHlp>(input: &T) -> anyhow::Result<HtcHlpCa
             Some(0.),
             0.,
             Some(ReportingFlag::Min),
+            true.into(),
             simtime.iter().current_iteration(),
         )?;
         let total_vent_heat_loss = calc_vent_heat_transfer_coeff(zone.volume, air_changes_per_hour);
 
         // Calculate fabric heat loss and total floor area
-        let total_fabric_heat_loss = zone
-            .building_elements
-            .values()
-            .map(calc_heat_loss)
-            .try_collect::<f64, Vec<f64>, anyhow::Error>()?
-            .iter()
-            .sum::<f64>();
+        let total_fabric_heat_loss = FSum::with_all(
+            zone.building_elements
+                .values()
+                .map(calc_heat_loss)
+                .try_collect::<f64, Vec<f64>, anyhow::Error>()?,
+        )
+        .value();
 
         // Read in thermal bridging data
         let tb_heat_trans_coeff = calc_heat_transfer_coeff(&zone.thermal_bridging);
@@ -647,14 +673,14 @@ pub fn calc_htc_hlp<T: InputForCalcHtcHlp>(input: &T) -> anyhow::Result<HtcHlpCa
         zone_area.insert(z_name.into(), zone.area);
     }
 
-    let total_htc = htc_map.values().sum::<f64>();
-    let total_floor_area = zone_area.values().sum::<f64>();
+    let total_htc = FSum::with_all(htc_map.values()).value();
+    let total_floor_area = FSum::with_all(zone_area.values()).value();
     let total_hlp = total_htc / total_floor_area;
 
     Ok(HtcHlpCalculation {
         total_htc,
         total_hlp,
-        _htc_map: htc_map,
+        htc_map,
         _hlp_map: hlp_map,
     })
 }
@@ -662,7 +688,7 @@ pub fn calc_htc_hlp<T: InputForCalcHtcHlp>(input: &T) -> anyhow::Result<HtcHlpCa
 pub struct HtcHlpCalculation {
     pub(crate) total_htc: f64,
     pub(crate) total_hlp: f64,
-    pub _htc_map: IndexMap<String, f64>,
+    pub htc_map: IndexMap<String, f64>,
     pub(crate) _hlp_map: IndexMap<String, f64>,
 }
 
@@ -673,8 +699,7 @@ pub struct Corpus {
     pre_heated_water_sources: IndexMap<String, HotWaterStorageTank>,
     pub(crate) energy_supplies: IndexMap<String, Arc<RwLock<EnergySupply>>>,
     pub(crate) internal_gains: InternalGainsCollection,
-    pub(crate) domestic_hot_water_demand:
-        DomesticHotWaterDemand<HotWaterSource, HotWaterStorageTank>,
+    pub(crate) domestic_hot_water_demand: DomesticHotWaterDemand,
     r_v_arg: AtomicF64,
     pub(crate) ventilation: Arc<InfiltrationVentilation>,
     pub(crate) zones: IndexMap<Arc<str>, Arc<Zone>>,
@@ -694,7 +719,7 @@ pub struct Corpus {
     energy_supply_conn_names_for_hot_water_source: IndexMap<String, Vec<String>>,
     energy_supply_conn_names_for_heat_systems: IndexMap<Arc<str>, Arc<str>>,
     hotwatersource_name_for_heatsourcewet_service: IndexMap<Arc<str>, Arc<str>>,
-    timestep_end_calcs: Arc<RwLock<Vec<WetHeatSource>>>,
+    timestep_end_calcs: Arc<RwLock<Vec<HeatSystem>>>,
     initial_loop: AtomicBool,
     detailed_output_heating_cooling: bool,
     vent_adjust_min_control: Option<Arc<Control>>,
@@ -734,7 +759,6 @@ impl Corpus {
         let wwhrs = wwhrs_from_input(
             input.waste_water_heat_recovery.as_ref(),
             &cold_water_sources,
-            simulation_time_iterator.current_iteration(),
         )?;
 
         let mut energy_supplies = energy_supplies_from_input(
@@ -755,7 +779,7 @@ impl Corpus {
             simulation_time_iterator.as_ref(),
         )?;
 
-        let total_volume = input.zone.values().map(|zone| zone.volume).sum::<f64>();
+        let total_volume = FSum::with_all(input.zone.values().map(|zone| zone.volume)).value();
 
         let mut heat_system_name_for_zone: IndexMap<Arc<str>, Vec<Arc<str>>> = Default::default();
         let mut cool_system_name_for_zone: IndexMap<Arc<str>, Vec<Arc<str>>> = Default::default();
@@ -807,15 +831,17 @@ impl Corpus {
             energy_supplies[UNMET_DEMAND_SUPPLY_NAME].clone(),
             &input.zone,
         );
-
-        let total_floor_area = zones.values().fold(0., |acc, zone| zone.area() + acc);
+        let total_floor_area = FSum::with_all(zones.values().map(|zone| zone.area())).value();
 
         // Internal gains is an ordered IndexMap. This is because load shifting behaviours
         // of appliance gains depend on other energy demand in the dwelling at any given time,
         // so depend on the order in which gains are considered by the engine.
         // See check_priority() in apply_appliance_gains_from_input()
-        let mut internal_gains =
-            internal_gains_from_input(&input.internal_gains, total_floor_area)?;
+        let mut internal_gains = internal_gains_from_input(
+            &input.internal_gains,
+            total_floor_area,
+            simulation_time_iterator.as_ref(),
+        )?;
 
         // setup smart control for loadshifting
         let mut smart_appliance_controls: IndexMap<String, Arc<SmartApplianceControl>> =
@@ -854,7 +880,15 @@ impl Corpus {
             simulation_time_iterator.as_ref(),
         )?;
 
-        let timestep_end_calcs: Arc<RwLock<Vec<WetHeatSource>>> = Default::default();
+        let timestep_end_calcs: Arc<RwLock<Vec<HeatSystem>>> = Default::default();
+
+        // Register WWHRS objects for timestep_end calls
+        for wwhrs in wwhrs.values() {
+            timestep_end_calcs
+                .write()
+                .push(HeatSystem::WwhrsSystem(wwhrs.clone()));
+        } // TODO review along with HeatSystem enum
+
         let mut heat_sources_wet_with_buffer_tank: Vec<String> = vec![];
         let mechanical_ventilations = infiltration_ventilation.mech_vents();
 
@@ -862,13 +896,19 @@ impl Corpus {
             temp_internal_air_for_zones(&zones, total_volume),
         ));
 
+        let existing_internal_gains_names: Vec<Arc<str>> = internal_gains.keys().cloned().collect();
+
         let mut heat_sources_wet: IndexMap<String, WetHeatSource> = input
             .heat_source_wet
             .clone()
             .unwrap_or_default()
             .iter()
             .map(|(name, heat_source_wet_details)| {
-                let heat_source = heat_source_wet_from_input(
+                let HeatSourceWetDataFromInput {
+                    heat_source,
+                    internal_gains_from_heat_source_wet,
+                    timestep_end_calcs_from_heat_sources,
+                } = heat_source_wet_from_input(
                     name,
                     (*heat_source_wet_details).clone(),
                     external_conditions.clone(),
@@ -878,9 +918,19 @@ impl Corpus {
                     shareable_fn(&temp_internal_air_prev),
                     &controls,
                     &mut energy_supplies,
+                    total_floor_area,
+                    &existing_internal_gains_names,
                     output_options.detailed_output_heating_cooling,
                 )?;
-                timestep_end_calcs.write().push(heat_source.clone());
+                // add any internal gains from heat source wet to existing list
+                for (name, internal_gains_item) in internal_gains_from_heat_source_wet {
+                    internal_gains.insert(name, Gains::Internal(internal_gains_item));
+                }
+                for timestep_end_calc_heat_source in timestep_end_calcs_from_heat_sources {
+                    timestep_end_calcs
+                        .write()
+                        .push(HeatSystem::WetSystem(timestep_end_calc_heat_source));
+                }
                 if let HeatSourceWetDetails::HeatPump {
                     buffer_tank: Some(_),
                     ..
@@ -896,19 +946,25 @@ impl Corpus {
             Default::default();
         let mut hot_water_source_name_for_service: IndexMap<Arc<str>, Arc<str>> =
             Default::default();
-        let mut used_heat_source_names: HashSet<String> = Default::default();
+        let mut used_heat_source_names: IndexSet<String> = Default::default();
 
         // Track pre-heat sources and WWHRS allocated to ensure single allocation only
         // This is required to avoid double-counting of the saving without significant additional
         // book-keeping code or a complete re-conceptualisation of the water heating calculation,
         // to handle an arrangement which is unlikely to occur in practice
-        let mut cold_water_sources_already_allocated: HashSet<String> = Default::default();
+        let mut cold_water_sources_already_allocated: IndexSet<String> = Default::default();
 
         // processing pre-heated sources
         let mut pre_heated_water_sources: IndexMap<String, HotWaterStorageTank> =
             Default::default();
 
-        for (source_name, source_details) in &input.pre_heated_water_source {
+        let init_order = {
+            let preheated_water_source_dependency_graph =
+                build_preheated_water_source_dependency_graph(&input.pre_heated_water_source);
+            topological_sort_preheated_water_sources(&preheated_water_source_dependency_graph)?
+        };
+        for source_name in init_order.iter() {
+            let source_details = &input.pre_heated_water_source[source_name];
             let (heat_source, energy_conn_names, preheated_source_names_for_service) =
                 hot_water_source_from_input(
                     source_name,
@@ -1157,53 +1213,37 @@ impl Corpus {
             .sum::<f64>()
     }
 
-    /// Calculate the losses/gains in the MVHR ductwork
+    /// Calculate the losses/gains in the MVHR ductwork, in Watts
     fn calc_internal_gains_ductwork(&self, simulation_time: SimulationTimeIteration) -> f64 {
-        let mut internal_gains_ductwork_watts = 0.0;
-        let space_heating_ductwork = self.ventilation.space_heating_ductworks();
-        for mvhr_ductwork in space_heating_ductwork.values() {
-            // assume MVHR unit is running 100% of the time
-            for duct in mvhr_ductwork {
-                match duct.duct_type() {
-                    DuctType::Intake | DuctType::Exhaust => {
-                        // Heat loss from intake or exhaust ducts is to zone, so add
-                        // to internal gains (may be negative gains)
-                        internal_gains_ductwork_watts += duct.total_duct_heat_loss(
-                            self.temp_internal_air_prev_timestep(),
-                            self.external_conditions.air_temp(&simulation_time),
-                        );
-                    }
-                    DuctType::Supply | DuctType::Extract => {
-                        // Heat loss from supply and extract ducts is to outside, so
-                        // subtract from internal gains
-                        internal_gains_ductwork_watts -= duct.total_duct_heat_loss(
-                            self.temp_internal_air_prev_timestep(),
-                            self.external_conditions.air_temp(&simulation_time),
-                        );
-                    }
-                }
-            }
-        }
-        internal_gains_ductwork_watts
+        let temp_outdoor_air = self.external_conditions.air_temp(&simulation_time);
+        let temp_indoor_air = self.temp_internal_air_prev_timestep();
+
+        self.ventilation
+            .calc_internal_gains_ductwork(temp_outdoor_air, temp_indoor_air)
     }
 
     fn space_heat_internal_gains_for_zone(
         &self,
         zone: &Zone,
-        gains_internal_dhw: f64,
+        gains_internal_dhw_on_site_generation: f64,
         gains_internal_hb: f64,
         internal_gains_ductwork_per_m3: f64,
         gains_internal_buffer_tank: f64,
         simtime: SimulationTimeIteration,
     ) -> anyhow::Result<f64> {
         // Initialise to dhw internal gains split proportionally to zone floor area
-        let mut gains_internal_zone =
-            (gains_internal_buffer_tank + gains_internal_dhw + gains_internal_hb) * zone.area()
-                / self.total_floor_area;
+        let mut gains_internal_zone = (gains_internal_buffer_tank
+            + gains_internal_dhw_on_site_generation
+            + gains_internal_hb)
+            * zone.area()
+            / self.total_floor_area;
 
         for internal_gains in self.internal_gains.values() {
             gains_internal_zone += internal_gains.total_internal_gain_in_w(zone.area(), simtime)?;
         }
+
+        // Add total gains from all ventilation ductwork (calculated previously)
+        gains_internal_zone += internal_gains_ductwork_per_m3 * zone.volume();
 
         // Add gains from ventilation fans (also calculates elec demand from fans)
         // TODO (from Python) Remove the branch on the type of ventilation (find a better way)
@@ -1211,7 +1251,6 @@ impl Corpus {
         for mech_vent in mech_vents.iter() {
             gains_internal_zone +=
                 mech_vent.fans(zone.volume(), self.total_volume, None, &simtime)?;
-            gains_internal_zone += internal_gains_ductwork_per_m3 * zone.volume();
         }
 
         Ok(gains_internal_zone)
@@ -1240,8 +1279,7 @@ impl Corpus {
         // listed first by the user takes priority
         let h_name_list_sorted: Vec<Arc<str>> = temp_setpnt_heat_system
             .iter()
-            .sorted_by(|a, b| OrderedFloat(*a.1).cmp(&OrderedFloat(*b.1)))
-            .rev()
+            .sorted_by(|a, b| OrderedFloat(*a.1).cmp(&OrderedFloat(*b.1)).reverse())
             .map(|x| x.0.to_owned())
             .collect();
         let c_name_list_sorted: Vec<Arc<str>> = temp_setpnt_cool_system
@@ -1286,7 +1324,7 @@ impl Corpus {
                     temp_setpnt_heat.insert(
                         h_name.clone(),
                         space_heat_system
-                            .temp_setpnt(simtime)?
+                            .temp_setpnt(simtime)
                             .unwrap_or_else(temp_setpnt_heat_none),
                     );
                 }
@@ -1327,10 +1365,12 @@ impl Corpus {
         hc_output_convective: &IndexMap<Arc<str>, f64>,
         hc_output_radiative: &IndexMap<Arc<str>, f64>,
     ) -> (f64, f64) {
-        let gains_heat_cool_convective =
-            hc_output_convective.values().sum::<f64>() * WATTS_PER_KILOWATT as f64 / delta_t_h;
-        let gains_heat_cool_radiative =
-            hc_output_radiative.values().sum::<f64>() * WATTS_PER_KILOWATT as f64 / delta_t_h;
+        let gains_heat_cool_convective = FSum::with_all(hc_output_convective.values()).value()
+            * WATTS_PER_KILOWATT as f64
+            / delta_t_h;
+        let gains_heat_cool_radiative = FSum::with_all(hc_output_radiative.values()).value()
+            * WATTS_PER_KILOWATT as f64
+            / delta_t_h;
 
         (gains_heat_cool_convective, gains_heat_cool_radiative)
     }
@@ -1341,14 +1381,14 @@ impl Corpus {
     fn calc_air_changes_per_hour(
         &self,
         wind_speed: f64,
-        wind_direction: f64,
+        wind_direction: Orientation360,
         temp_int_air: f64,
         temp_ext_air: f64,
         r_v_arg: f64,
         r_w_arg: Option<f64>,
         initial_p_z_ref_guess: f64,
         reporting_flag: ReportingFlag,
-        internal_pressure_window: &mut HashMap<ReportingFlag, f64>,
+        internal_pressure_window: &mut IndexMap<ReportingFlag, f64>,
         simtime: SimulationTimeIteration,
     ) -> anyhow::Result<f64> {
         let current_internal_pressure_window = if self.initial_loop.load(Ordering::SeqCst) {
@@ -1396,10 +1436,10 @@ impl Corpus {
     /// Get minimum output for each heating/cooling system in the specified zone
     fn heat_cool_system_output_min(
         &self,
-        h_name_list_sorted_zone: &HashMap<&str, Vec<Arc<str>>>,
-        c_name_list_sorted_zone: &HashMap<&str, Vec<Arc<str>>>,
-        frac_convective_heat_zone_system: &HashMap<&str, IndexMap<Arc<str>, f64>>,
-        frac_convective_cool_zone_system: &HashMap<&str, IndexMap<Arc<str>, f64>>,
+        h_name_list_sorted_zone: &IndexMap<&str, Vec<Arc<str>>>,
+        c_name_list_sorted_zone: &IndexMap<&str, Vec<Arc<str>>>,
+        frac_convective_heat_zone_system: &IndexMap<&str, IndexMap<Arc<str>, f64>>,
+        frac_convective_cool_zone_system: &IndexMap<&str, IndexMap<Arc<str>, f64>>,
         z_name: &str,
         simulation_time_iteration: SimulationTimeIteration,
     ) -> anyhow::Result<HeatCoolOutputs> {
@@ -1470,14 +1510,14 @@ impl Corpus {
     ///
     /// Arguments:
     /// * `delta_t_h` - calculation timestep, in hours
-    /// * `gains_internal_dhw` - internal gains from hot water system for this timestep, in W
+    /// * `gains_internal_dhw_on_site_generation` - internal gains from hot water system and on site generation for this timestep, in W
     /// * `gains_internal_hb` - internal gains from central heat battery systems for this timestep, in W
     fn calc_space_heating(
         &self,
         delta_t_h: f64,
-        gains_internal_dhw: f64,
+        gains_internal_dhw_on_site_generation: f64,
         gains_internal_hb: f64,
-        internal_pressure_window: &mut HashMap<ReportingFlag, f64>,
+        internal_pressure_window: &mut IndexMap<ReportingFlag, f64>,
         simtime: SimulationTimeIteration,
     ) -> anyhow::Result<SpaceHeatingCalculation> {
         let wind_speed = self.external_conditions.wind_speed(&simtime);
@@ -1560,27 +1600,27 @@ impl Corpus {
             ach_windows_shut
         };
 
-        let mut gains_internal_zone: HashMap<Arc<str>, f64> = Default::default();
-        let mut gains_solar_zone: HashMap<Arc<str>, f64> = Default::default();
-        let mut h_name_list_sorted_zone: HashMap<&str, Vec<Arc<str>>> = Default::default();
-        let mut c_name_list_sorted_zone: HashMap<&str, Vec<Arc<str>>> = Default::default();
-        let mut temp_setpnt_heat_zone_system: HashMap<&str, IndexMap<Arc<str>, f64>> =
+        let mut gains_internal_zone: IndexMap<Arc<str>, f64> = Default::default();
+        let mut gains_solar_zone: IndexMap<Arc<str>, f64> = Default::default();
+        let mut h_name_list_sorted_zone: IndexMap<&str, Vec<Arc<str>>> = Default::default();
+        let mut c_name_list_sorted_zone: IndexMap<&str, Vec<Arc<str>>> = Default::default();
+        let mut temp_setpnt_heat_zone_system: IndexMap<&str, IndexMap<Arc<str>, f64>> =
             Default::default();
-        let mut temp_setpnt_cool_zone_system: HashMap<&str, IndexMap<Arc<str>, f64>> =
+        let mut temp_setpnt_cool_zone_system: IndexMap<&str, IndexMap<Arc<str>, f64>> =
             Default::default();
-        let mut frac_convective_heat_zone_system: HashMap<&str, IndexMap<Arc<str>, f64>> =
+        let mut frac_convective_heat_zone_system: IndexMap<&str, IndexMap<Arc<str>, f64>> =
             Default::default();
-        let mut frac_convective_cool_zone_system: HashMap<&str, IndexMap<Arc<str>, f64>> =
+        let mut frac_convective_cool_zone_system: IndexMap<&str, IndexMap<Arc<str>, f64>> =
             Default::default();
-        let mut ach_cooling_zone: HashMap<&str, f64> = Default::default();
-        let mut ach_to_trigger_heating_zone: HashMap<&str, Option<f64>> = Default::default();
-        let mut internal_air_temp: HashMap<Arc<str>, f64> = Default::default();
-        let mut operative_temp: HashMap<Arc<str>, f64> = Default::default();
-        let mut space_heat_demand_zone: HashMap<Arc<str>, f64> = Default::default();
-        let mut space_cool_demand_zone: HashMap<Arc<str>, f64> = Default::default();
-        let mut space_heat_provided_system: HashMap<Arc<str>, f64> = Default::default();
-        let mut space_cool_provided_system: HashMap<Arc<str>, f64> = Default::default();
-        let mut heat_balance_map: HashMap<Arc<str>, Option<HeatBalance>> = Default::default();
+        let mut ach_cooling_zone: IndexMap<&str, f64> = Default::default();
+        let mut ach_to_trigger_heating_zone: IndexMap<&str, Option<f64>> = Default::default();
+        let mut internal_air_temp: IndexMap<Arc<str>, f64> = Default::default();
+        let mut operative_temp: IndexMap<Arc<str>, f64> = Default::default();
+        let mut space_heat_demand_zone: IndexMap<Arc<str>, f64> = Default::default();
+        let mut space_cool_demand_zone: IndexMap<Arc<str>, f64> = Default::default();
+        let mut space_heat_provided_system: IndexMap<Arc<str>, f64> = Default::default();
+        let mut space_cool_provided_system: IndexMap<Arc<str>, f64> = Default::default();
+        let mut heat_balance_map: IndexMap<Arc<str>, Option<HeatBalance>> = Default::default();
 
         // Average supply temperature
         let avg_air_supply_temp = self.external_conditions.air_temp(&simtime);
@@ -1592,7 +1632,7 @@ impl Corpus {
                 z_name.into(),
                 self.space_heat_internal_gains_for_zone(
                     zone,
-                    gains_internal_dhw,
+                    gains_internal_dhw_on_site_generation,
                     gains_internal_hb,
                     internal_gains_ductwork_per_m3,
                     internal_gains_buffer_tank,
@@ -1727,24 +1767,22 @@ impl Corpus {
         // Calculate heating/cooling system response and temperature achieved in each zone
         for (z_name, zone) in self.zones.iter() {
             let z_name = z_name.as_ref();
-            let c_name_list_hashset = c_name_list_sorted_zone[z_name]
-                .iter()
-                .filter(|name| !name.is_empty()) // Ignore the "" placeholder to ensure zones with no system don't trigger the uniqueness error
-                .collect::<HashSet<_>>();
-            let h_name_list_hashset = h_name_list_sorted_zone[z_name]
-                .iter()
-                .filter(|name| !name.is_empty()) // Ignore the "" placeholder to ensure zones with no system don't trigger the uniqueness error
-                .collect::<HashSet<_>>();
-            let intersection = h_name_list_hashset
-                .intersection(&c_name_list_hashset)
-                .collect::<Vec<_>>();
-            if !intersection.is_empty() {
-                bail!("All heating and cooling systems must have unique names")
-            };
-            // drop temporary values for working out intersection from scope
-            drop(intersection);
-            drop(c_name_list_hashset);
-            drop(h_name_list_hashset);
+            {
+                let c_name_list_hashset = c_name_list_sorted_zone[z_name]
+                    .iter()
+                    .filter(|name| !name.is_empty()) // Ignore the "" placeholder to ensure zones with no system don't trigger the uniqueness error
+                    .collect::<IndexSet<_>>();
+                let h_name_list_hashset = h_name_list_sorted_zone[z_name]
+                    .iter()
+                    .filter(|name| !name.is_empty()) // Ignore the "" placeholder to ensure zones with no system don't trigger the uniqueness error
+                    .collect::<IndexSet<_>>();
+                let intersection = h_name_list_hashset
+                    .intersection(&c_name_list_hashset)
+                    .collect::<Vec<_>>();
+                if !intersection.is_empty() {
+                    bail!("All heating and cooling systems must have unique names")
+                };
+            }
 
             // Initialise system outputs to minimum output for each heating and cooling system
             let HeatCoolOutputs {
@@ -1778,7 +1816,6 @@ impl Corpus {
 
             let mut h_idx: usize = 0;
             let mut c_idx: usize = 0;
-            let _space_heat_running_time_cumulative = 0.0;
 
             // these following variables need to be referenced outside the while loop with their last value retained
 
@@ -1801,7 +1838,17 @@ impl Corpus {
                 // lower-priority systems).
                 let (gains_heat_cool_convective, gains_heat_cool_radiative) =
                     self.gains_heat_cool(delta_t_h, &hc_output_convective, &hc_output_radiative);
-                if gains_heat_cool_convective == 0.0 && gains_heat_cool_radiative == 0.0 {
+                if is_close!(
+                    gains_heat_cool_convective,
+                    0.0,
+                    abs_tol = 1e-10,
+                    rel_tol = 1e-9
+                ) && is_close!(
+                    gains_heat_cool_radiative,
+                    0.0,
+                    abs_tol = 1e-10,
+                    rel_tol = 1e-9
+                ) {
                     // If there is no output from any systems, then don't need to
                     // calculate demand again
                     space_heat_demand_zone_system.insert(h_name, space_heat_demand_zone[z_name]);
@@ -1967,18 +2014,19 @@ impl Corpus {
             )?;
 
             // Sum heating gains (+ve) and cooling gains (-ve) and convert from kWh to W
-            let hc_output_convective_total = hc_output_convective.values().sum::<f64>();
-            let hc_output_radiative_total = hc_output_radiative.values().sum::<f64>();
+            let hc_output_convective_total = FSum::with_all(hc_output_convective.values()).value();
+            let hc_output_radiative_total = FSum::with_all(hc_output_radiative.values()).value();
 
             let gains_heat_cool = (hc_output_convective_total + hc_output_radiative_total)
                 * WATTS_PER_KILOWATT as f64
                 / delta_t_h;
-            let frac_convective = if gains_heat_cool != 0.0 {
-                hc_output_convective_total
-                    / (hc_output_convective_total + hc_output_radiative_total)
-            } else {
-                1.0
-            };
+            let frac_convective =
+                if !is_close!(gains_heat_cool, 0.0, abs_tol = 1e-10, rel_tol = 1e-9) {
+                    hc_output_convective_total
+                        / (hc_output_convective_total + hc_output_radiative_total)
+                } else {
+                    1.0
+                };
 
             // Calculate final temperatures achieved
             heat_balance_map.insert(
@@ -2042,7 +2090,7 @@ impl Corpus {
         for hc_name in hc_name_list_sorted {
             if !hc_name.is_empty()
                 && space_heat_cool_systems
-                    .in_required_period_for_name(hc_name, simtime)?
+                    .in_required_period_for_name(hc_name, simtime)
                     .unwrap_or(false)
             {
                 hc_name_highest_req = Some(hc_name.clone());
@@ -2105,18 +2153,14 @@ impl Corpus {
             simtime,
         )?;
 
-        let gains_heat = h_name_list_sorted
-            .iter()
-            .map(|h_name| {
-                hc_output_convective[h_name.as_ref()] + hc_output_radiative[h_name.as_ref()]
-            })
-            .sum::<f64>();
-        let gains_cool = c_name_list_sorted
-            .iter()
-            .map(|c_name| {
-                hc_output_convective[c_name.as_ref()] + hc_output_radiative[c_name.as_ref()]
-            })
-            .sum::<f64>();
+        let gains_heat = FSum::with_all(h_name_list_sorted.iter().map(|h_name| {
+            hc_output_convective[h_name.as_ref()] + hc_output_radiative[h_name.as_ref()]
+        }))
+        .value();
+        let gains_cool = FSum::with_all(c_name_list_sorted.iter().map(|c_name| {
+            hc_output_convective[c_name.as_ref()] + hc_output_radiative[c_name.as_ref()]
+        }))
+        .value();
         let energy_shortfall_heat = 0.0f64.max(space_heat_demand - gains_heat);
         let energy_shortfall_cool = 0.0f64.max(-(space_cool_demand - gains_cool));
 
@@ -2221,11 +2265,12 @@ impl Corpus {
             Default::default();
         let mut heat_source_wet_results_annual_dict: IndexMap<Arc<str>, ResultsAnnual> =
             Default::default();
-        let mut emitters_output_dict: IndexMap<Arc<str>, Vec<OutputEmitters>> = Default::default();
+        let mut emitters_output_dict: IndexMap<Arc<str>, Vec<Option<OutputEmitters>>> =
+            Default::default();
         let mut esh_output_dict: IndexMap<Arc<str>, Vec<StorageHeaterDetailedResult>> =
             Default::default();
         let mut vent_output_list: Vec<VentilationDetailedResult> = Default::default();
-        let mut hot_water_source_results_summary: IndexMap<Arc<str>, Vec<Vec<StringOrNumber>>> =
+        let mut hot_water_source_results: IndexMap<Arc<str>, Vec<Vec<StringOrNumber>>> =
             Default::default();
 
         for z_name in self.zones.keys() {
@@ -2243,13 +2288,21 @@ impl Corpus {
 
         for z_h_names in self.heat_system_name_for_zone.values() {
             for h_name in z_h_names {
-                space_heat_provided_dict.insert(Some(h_name.clone()), vec_capacity());
+                let h_name = match h_name.as_ref() {
+                    "" => None,
+                    _ => Some(h_name.clone()),
+                };
+                space_heat_provided_dict.insert(h_name, vec_capacity());
             }
         }
 
         for z_c_names in self.cool_system_name_for_zone.values() {
             for c_name in z_c_names {
-                space_cool_provided_dict.insert(Some(c_name.clone()), vec_capacity());
+                let c_name = match c_name.as_ref() {
+                    "" => None,
+                    _ => Some(c_name.clone()),
+                };
+                space_cool_provided_dict.insert(c_name, vec_capacity());
             }
         }
 
@@ -2308,13 +2361,17 @@ impl Corpus {
             .collect();
         let mut ductwork_gains_list = vec_capacity();
         self.initial_loop.store(true, Ordering::SeqCst);
-        let mut internal_pressure_window: HashMap<ReportingFlag, f64> = Default::default();
+        let mut internal_pressure_window: IndexMap<ReportingFlag, f64> = Default::default();
 
         let delta_t_h = simulation_time.step_in_hours();
 
         // Loop over each timestep
         #[cfg(feature = "indicatif")]
-        let simulation_time_iter = simulation_time.progress();
+        let simulation_time_iter = {
+            let pb = ProgressBar::new(simulation_time.total_steps() as u64);
+            pb.set_style(ProgressStyle::with_template("{spinner:.cyan} [{elapsed_precise}] [{bar:80.green/red}] ({human_pos}/{human_len}, ETA {eta})").expect("Could not create progress bar style"));
+            simulation_time.progress_with(pb)
+        };
         #[cfg(not(feature = "indicatif"))]
         let simulation_time_iter = simulation_time;
 
@@ -2339,7 +2396,8 @@ impl Corpus {
                 self.external_conditions.air_temp(&t_it),
             )?;
 
-            let mut gains_internal_dhw_on_site_generation: f64 = gains_internal_dhw.values().sum();
+            let mut gains_internal_dhw_on_site_generation =
+                FSum::with_all(gains_internal_dhw.values()).value();
 
             let mut gains_internal_hb = 0.;
             // Adding heat battery losses to internal gains
@@ -2420,15 +2478,23 @@ impl Corpus {
             }
 
             for (h_name, output) in space_heat_provided {
+                let h_name = match h_name.as_ref() {
+                    "" => None,
+                    _ => Some(h_name.clone()),
+                };
                 space_heat_provided_dict
-                    .get_mut(&Some(h_name.clone()))
+                    .get_mut(&h_name)
                     .unwrap()
                     .push(output);
             }
 
             for (c_name, output) in space_cool_provided {
+                let c_name = match c_name.as_ref() {
+                    "" => None,
+                    _ => Some(c_name.clone()),
+                };
                 space_cool_provided_dict
-                    .get_mut(&Some(c_name.clone()))
+                    .get_mut(&c_name)
                     .unwrap()
                     .push(output);
             }
@@ -2482,12 +2548,11 @@ impl Corpus {
             ductwork_gains_list.push(ductwork_gains);
 
             for supply in self.energy_supplies.values() {
-                anyhow::Ok(supply.read().calc_energy_import_export_betafactor(t_it)?)?;
-                anyhow::Ok(
-                    supply
-                        .read()
-                        .calc_energy_import_from_grid_to_battery(t_it)?,
-                )?;
+                supply.read().calc_energy_import_export_betafactor(t_it)?;
+                supply
+                    .read()
+                    .calc_energy_import_from_grid_to_battery(t_it)?;
+                supply.read().timestep_end();
             }
 
             for diverter in &self.diverters {
@@ -2552,7 +2617,7 @@ impl Corpus {
                             if let Some(hot_water_source_output) =
                                 storage_tank.read().output_results()
                             {
-                                hot_water_source_results_summary
+                                hot_water_source_results
                                     .insert(name.to_string().into(), hot_water_source_output);
                             }
                         }
@@ -2560,10 +2625,12 @@ impl Corpus {
                             if let Some(hot_water_source_output) =
                                 smart_storage_tank.read().output_results()
                             {
-                                hot_water_source_results_summary
+                                hot_water_source_results
                                     .insert(name.to_string().into(), hot_water_source_output);
                             }
                         }
+                        #[cfg(test)]
+                        HotWaterStorageTank::Mock(_source) => {}
                     }
                 }
             }
@@ -2696,10 +2763,18 @@ impl Corpus {
                 .collect(), // TODO (from Python) could be output object too fixed keys...
             heat_source_wet_results: heat_source_wet_results_dict,
             heat_source_wet_results_annual: heat_source_wet_results_annual_dict,
-            hot_water_source_results_summary,
+            hot_water_source_results,
             emitters: emitters_output_dict
                 .into_iter()
-                .map(|(k, v)| (k, v.into_iter().enumerate().collect()))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        v.into_iter()
+                            .enumerate()
+                            .filter_map(|(k, v)| v.map(|v| (k, v)))
+                            .collect(),
+                    )
+                })
                 .collect(),
             electric_storage_heaters: esh_output_dict
                 .into_iter()
@@ -2721,7 +2796,7 @@ impl Corpus {
             summary: self.calculate_output_summary(&output_core),
             core: output_core,
             metadata: OutputMetadata {
-                hem_core_version: HEM_VERSION,
+                hem_core_version: HEM_VERSION.into(),
             },
         })
     }
@@ -2742,7 +2817,7 @@ impl Corpus {
                 Some(hc_name) if !hc_name.is_empty() => hc_name,
                 _ => continue,
             };
-            hc_output_overall.insert(hc_name.clone(), hc_output.iter().sum::<f64>().abs());
+            hc_output_overall.insert(hc_name.clone(), FSum::with_all(hc_output).value().abs());
             hc_input_overall.insert(hc_name.clone(), 0.);
             let energy_supply_conn_names =
                 energy_supply_conn_name_for_space_hc_system[hc_name].clone();
@@ -2755,7 +2830,7 @@ impl Corpus {
                 for (conn_name, energy_cons) in fuel_summary {
                     if energy_supply_conn_names.contains(conn_name) {
                         *hc_input_overall.get_mut(hc_name).unwrap() +=
-                            energy_cons.iter().sum::<f64>();
+                            FSum::with_all(energy_cons).value();
                     }
                 }
             }
@@ -2799,36 +2874,33 @@ impl Corpus {
         let mut energy_supply_stats: IndexMap<Arc<str>, OutputSummaryEnergySupply> =
             Default::default();
         for (key, result) in &output_core.results_end_user {
-            let mut elec_generated = 0.;
-            let mut elec_consumed = 0.;
+            let mut total_generated = 0.;
+            let mut total_consumed = 0.;
             for result_value in result.values() {
-                let sum_arr: f64 = result_value.iter().sum();
+                let sum_arr = FSum::with_all(result_value).value();
                 if sum_arr < 0. {
-                    elec_generated += sum_arr.abs();
+                    total_generated += sum_arr.abs();
                 } else {
-                    elec_consumed += sum_arr;
+                    total_consumed += sum_arr;
                 }
             }
 
-            let grid_to_consumption: f64 = output_core.grid_to_consumption[key].iter().sum();
-            let generation_to_grid: f64 = output_core.generation_to_grid[key]
-                .iter()
-                .sum::<f64>()
+            let grid_to_consumption = FSum::with_all(&output_core.grid_to_consumption[key]).value();
+            let generation_to_grid = FSum::with_all(&output_core.generation_to_grid[key])
+                .value()
                 .abs();
-            let gen_to_storage: f64 = output_core.energy_to_storage[key].iter().sum();
-            let storage_to_consumption: f64 = output_core.energy_from_storage[key]
-                .iter()
-                .sum::<f64>()
+            let gen_to_storage = FSum::with_all(&output_core.energy_to_storage[key]).value();
+            let storage_to_consumption = FSum::with_all(&output_core.energy_from_storage[key])
+                .value()
                 .abs();
-            let gen_to_diverter: f64 = output_core.energy_diverted[key].iter().sum();
-            let total_gross_import: f64 = output_core.energy_import[key].iter().sum();
-            let total_gross_export: f64 = output_core.energy_export[key].iter().sum();
+            let gen_to_diverter = FSum::with_all(&output_core.energy_diverted[key]).value();
+            let total_gross_import = FSum::with_all(&output_core.energy_import[key]).value();
+            let total_gross_export = FSum::with_all(&output_core.energy_export[key]).value();
 
-            let storage_eff = if gen_to_storage > 0. {
-                {
-                    storage_to_consumption
-                        / (gen_to_storage + output_core.storage_from_grid[key].iter().sum::<f64>())
-                }
+            let total_energy_into_battery =
+                gen_to_storage + FSum::with_all(&output_core.storage_from_grid[key]).value();
+            let storage_eff = if total_energy_into_battery > 0. {
+                storage_to_consumption / total_energy_into_battery
             } else {
                 f64::NAN
             };
@@ -2836,8 +2908,8 @@ impl Corpus {
             energy_supply_stats.insert(
                 key.clone(),
                 OutputSummaryEnergySupply {
-                    electricity_generated: elec_generated,
-                    electricity_consumed: elec_consumed,
+                    generation: total_generated,
+                    consumption: total_consumed,
                     generation_to_consumption: output_core.energy_generated_consumed[key]
                         .iter()
                         .sum(),
@@ -2846,9 +2918,11 @@ impl Corpus {
                     net_import: total_gross_import + total_gross_export,
                     generation_to_storage: gen_to_storage,
                     storage_to_consumption,
-                    grid_to_storage: output_core.storage_from_grid[key].iter().sum::<f64>().abs(),
+                    grid_to_storage: FSum::with_all(&output_core.storage_from_grid[key])
+                        .value()
+                        .abs(),
                     generation_to_diverter: gen_to_diverter,
-                    storage_efficiency: storage_eff,
+                    storage_efficiency: Some(storage_eff),
                     total_gross_import,
                     total_gross_export,
                 },
@@ -2868,8 +2942,10 @@ impl Corpus {
                 delivered_energy_dict.insert(fuel.clone(), IndexMap::from([("total".into(), 0.)]));
 
                 for (end_use, delivered_energy) in end_uses {
-                    let sum_delivered_energy = delivered_energy.iter().sum::<f64>();
-                    if sum_delivered_energy >= 0. {
+                    let sum_delivered_energy = FSum::with_all(delivered_energy).value();
+                    if sum_delivered_energy > 0.
+                        || is_close!(sum_delivered_energy, 0., rel_tol = 1e-09, abs_tol = 1e-10)
+                    {
                         delivered_energy_dict[fuel].insert(end_use.clone(), sum_delivered_energy);
                         delivered_energy_dict[fuel]["total"] += sum_delivered_energy;
                         delivered_energy_dict["total"]
@@ -2893,22 +2969,14 @@ impl Corpus {
                 simulation_time.step,
             );
             hot_water_demand_daily_75th_percentile_dict
-                .insert(hws_name.clone(), percentile(&daily_hw_demand, 75));
+                .insert(hws_name.clone(), percentile(daily_hw_demand, 75));
         }
 
-        let space_heat_demand_total = output_core
-            .zone_data
-            .space_heat_demand
-            .values()
-            .flatten()
-            .sum::<f64>();
+        let space_heat_demand_total =
+            FSum::with_all(output_core.zone_data.space_heat_demand.values().flatten()).value();
 
-        let space_cool_demand_total = output_core
-            .zone_data
-            .space_cool_demand
-            .values()
-            .flatten()
-            .sum::<f64>();
+        let space_cool_demand_total =
+            FSum::with_all(output_core.zone_data.space_cool_demand.values().flatten()).value();
 
         OutputSummary {
             total_floor_area: self.total_floor_area,
@@ -2961,12 +3029,10 @@ impl Corpus {
         // Add because export figures already negative.
         let net_import_per_timestep = (0..output_core.timestep_array.len())
             .map(|i| {
-                electricity_keys
-                    .iter()
-                    .map(|key| {
-                        output_core.energy_import[key][i] + output_core.energy_export[key][i]
-                    })
-                    .sum::<f64>()
+                FSum::with_all(electricity_keys.iter().map(|key| {
+                    output_core.energy_import[key][i] + output_core.energy_export[key][i]
+                }))
+                .value()
             })
             .collect_vec();
 
@@ -2991,7 +3057,7 @@ impl Corpus {
             index: index_peak_elec_consumption,
             month: peak_datetime.month() as u8,
             day: peak_datetime.day() as u8,
-            hour: ((peak_step % (24. / stepping)) * stepping + 1.) as u8,
+            hour: ((peak_step % (24. / stepping)) * stepping),
         }
     }
 }
@@ -3031,7 +3097,7 @@ pub enum HotWaterResultMap {
     Int(IndexMap<Arc<str>, Vec<usize>>),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 pub enum NumberOrDivisionByZero {
     Number(f64),
     DivisionByZero,
@@ -3071,8 +3137,6 @@ impl Serialize for NumberOrDivisionByZero {
     }
 }
 
-pub type ResultsEndUser = IndexMap<String, IndexMap<String, Vec<f64>>>;
-
 enum SpaceHeatCoolSystems<'a> {
     Heat(&'a IndexMap<Arc<str>, Arc<Mutex<SpaceHeatSystem>>>),
     Cool(&'a IndexMap<Arc<str>, AirConditioning>),
@@ -3083,12 +3147,12 @@ impl SpaceHeatCoolSystems<'_> {
         &self,
         system_name: &str,
         simtime: SimulationTimeIteration,
-    ) -> anyhow::Result<Option<bool>> {
+    ) -> Option<bool> {
         match self {
             SpaceHeatCoolSystems::Heat(heat) => {
                 heat[system_name].lock().in_required_period(simtime)
             }
-            SpaceHeatCoolSystems::Cool(cool) => Ok(cool[system_name].in_required_period(&simtime)),
+            SpaceHeatCoolSystems::Cool(cool) => cool[system_name].in_required_period(&simtime),
         }
     }
 }
@@ -3099,14 +3163,14 @@ struct HeatCoolSystemsForZone {
     setpoints_and_convective_fractions: SetpointsAndConvectiveFractions,
 }
 
-pub type ColdWaterSources = IndexMap<String, Arc<ColdWaterSource>>;
+pub type ColdWaterSources = IndexMap<Arc<str>, Arc<ColdWaterSource>>;
 
 fn cold_water_sources_from_input(input: &ColdWaterSourceInput) -> ColdWaterSources {
     input
         .iter()
         .map(|(source_type, source_details)| {
             (
-                source_type.into(),
+                source_type.as_str().into(),
                 Arc::from(cold_water_source_from_input_details(source_details)),
             )
         })
@@ -3254,6 +3318,7 @@ pub(crate) type InternalGainsCollection = IndexMap<Arc<str>, Gains>;
 fn internal_gains_from_input(
     input: &InternalGainsInput,
     total_floor_area: f64,
+    simulation_time_iterator: &SimulationTimeIterator,
 ) -> anyhow::Result<InternalGainsCollection> {
     let mut gains_collection = InternalGainsCollection::from([]);
     if let Some(internal_gains) = input.total_internal_gains.as_ref() {
@@ -3262,6 +3327,7 @@ fn internal_gains_from_input(
             Gains::Internal(internal_gains_from_details(
                 internal_gains,
                 total_floor_area,
+                simulation_time_iterator,
             )?),
         );
     }
@@ -3271,6 +3337,7 @@ fn internal_gains_from_input(
             Gains::Internal(internal_gains_from_details(
                 internal_gains,
                 total_floor_area,
+                simulation_time_iterator,
             )?),
         );
     }
@@ -3280,6 +3347,7 @@ fn internal_gains_from_input(
             Gains::Internal(internal_gains_from_details(
                 internal_gains,
                 total_floor_area,
+                simulation_time_iterator,
             )?),
         );
     }
@@ -3289,6 +3357,7 @@ fn internal_gains_from_input(
             Gains::Internal(internal_gains_from_details(
                 internal_gains,
                 total_floor_area,
+                simulation_time_iterator,
             )?),
         );
     }
@@ -3298,6 +3367,7 @@ fn internal_gains_from_input(
             Gains::Internal(internal_gains_from_details(
                 internal_gains,
                 total_floor_area,
+                simulation_time_iterator,
             )?),
         );
     }
@@ -3308,12 +3378,14 @@ fn internal_gains_from_input(
 fn internal_gains_from_details(
     details: &InternalGainsDetails,
     total_floor_area: f64,
+    simulation_time_iterator: &SimulationTimeIterator,
 ) -> anyhow::Result<InternalGains> {
-    Ok(InternalGains::new(
+    InternalGains::new(
         convert_energy_to_wm2(details, total_floor_area)?,
         details.start_day,
         details.time_series_step,
-    ))
+        simulation_time_iterator,
+    )
 }
 
 fn convert_energy_to_wm2(
@@ -3330,11 +3402,11 @@ fn convert_energy_to_wm2(
 #[derive(Debug)]
 pub struct Controls {
     core: Vec<HeatSourceControl>,
-    extra: HashMap<String, Arc<Control>>,
+    extra: IndexMap<String, Arc<Control>>,
 }
 
 impl Controls {
-    pub(crate) fn new(core: Vec<HeatSourceControl>, extra: HashMap<String, Arc<Control>>) -> Self {
+    pub(crate) fn new(core: Vec<HeatSourceControl>, extra: IndexMap<String, Arc<Control>>) -> Self {
         Self { core, extra }
     }
 
@@ -3358,7 +3430,6 @@ impl Controls {
 fn wwhrs_from_input(
     wwhrs: Option<&WasteWaterHeatRecovery>,
     cold_water_sources: &ColdWaterSources,
-    initial_simtime: SimulationTimeIteration,
 ) -> anyhow::Result<IndexMap<String, Arc<Mutex<WwhrsInstantaneous>>>> {
     let mut wwhr_systems: IndexMap<String, Arc<Mutex<WwhrsInstantaneous>>> = IndexMap::from([]);
     if let Some(systems) = wwhrs {
@@ -3368,7 +3439,6 @@ fn wwhrs_from_input(
                 .or_insert(Arc::new(Mutex::new(wwhr_system_from_details(
                     system.clone(),
                     cold_water_sources,
-                    initial_simtime,
                 )?)));
         }
     }
@@ -3379,9 +3449,8 @@ fn wwhrs_from_input(
 fn wwhr_system_from_details(
     system: WasteWaterHeatRecoveryDetails,
     cold_water_sources: &ColdWaterSources,
-    initial_simtime: SimulationTimeIteration,
 ) -> anyhow::Result<WwhrsInstantaneous> {
-    let cold_water_source = cold_water_sources.get(&system.cold_water_source).ok_or_else(|| anyhow!("Cold water source '{}' referenced by WWHRS input not found in cold water sources list.", system.cold_water_source))?;
+    let cold_water_source = cold_water_sources.get(system.cold_water_source.as_str()).ok_or_else(|| anyhow!("Cold water source '{}' referenced by WWHRS input not found in cold water sources list.", system.cold_water_source))?;
 
     // Get efficiency data for all systems if provided
     let WasteWaterHeatRecoveryDetails {
@@ -3408,7 +3477,6 @@ fn wwhr_system_from_details(
         system_c_utilisation_factor,
         system_b_efficiency_factor.into(),
         system_c_efficiency_factor.into(),
-        initial_simtime,
     )
 }
 
@@ -3451,16 +3519,16 @@ pub(crate) type HeatBalanceAllResults =
     IndexMap<HeatBalanceFieldName, IndexMap<Arc<str>, IndexMap<Arc<str>, Vec<f64>>>>;
 
 struct SpaceHeatingCalculation {
-    gains_internal_zone: HashMap<Arc<str>, f64>,
-    gains_solar_zone: HashMap<Arc<str>, f64>,
-    operative_temp: HashMap<Arc<str>, f64>,
-    internal_air_temp: HashMap<Arc<str>, f64>,
-    space_heat_demand_zone: HashMap<Arc<str>, f64>,
-    space_cool_demand_zone: HashMap<Arc<str>, f64>,
-    space_heat_provided_system: HashMap<Arc<str>, f64>,
-    space_cool_provided_system: HashMap<Arc<str>, f64>,
+    gains_internal_zone: IndexMap<Arc<str>, f64>,
+    gains_solar_zone: IndexMap<Arc<str>, f64>,
+    operative_temp: IndexMap<Arc<str>, f64>,
+    internal_air_temp: IndexMap<Arc<str>, f64>,
+    space_heat_demand_zone: IndexMap<Arc<str>, f64>,
+    space_cool_demand_zone: IndexMap<Arc<str>, f64>,
+    space_heat_provided_system: IndexMap<Arc<str>, f64>,
+    space_cool_provided_system: IndexMap<Arc<str>, f64>,
     internal_gains_ductwork: f64,
-    heat_balance_map: HashMap<Arc<str>, Option<HeatBalance>>,
+    heat_balance_map: IndexMap<Arc<str>, Option<HeatBalance>>,
 }
 
 #[derive(Clone, Copy, Deserialize_enum_str, Debug, Eq, Hash, PartialEq, Serialize_enum_str)]
@@ -3651,9 +3719,9 @@ fn zone_from_input(
     .collect();
 
     for zone_h_name in heat_system_name_for_zone.values() {
-        let zone_h_name_set: HashSet<Arc<str>> = HashSet::from_iter(zone_h_name.iter().cloned());
+        let zone_h_name_set: IndexSet<Arc<str>> = IndexSet::from_iter(zone_h_name.iter().cloned());
         let h_overassigned: Vec<Arc<str>> =
-            HashSet::from_iter(heat_system_names.clone().into_iter())
+            IndexSet::<Arc<str>>::from_iter(heat_system_names.clone())
                 .intersection(&zone_h_name_set)
                 .filter(|&name| !name.is_empty())
                 .cloned()
@@ -3678,9 +3746,9 @@ fn zone_from_input(
     .collect();
 
     for zone_c_name in cool_system_name_for_zone.values() {
-        let zone_c_name_set: HashSet<Arc<str>> = HashSet::from_iter(zone_c_name.iter().cloned());
+        let zone_c_name_set: IndexSet<Arc<str>> = IndexSet::from_iter(zone_c_name.iter().cloned());
         let c_overassigned: Vec<Arc<str>> =
-            HashSet::from_iter(cool_system_names.clone().into_iter())
+            IndexSet::<Arc<str>>::from_iter(cool_system_names.clone())
                 .intersection(&zone_c_name_set)
                 .filter(|&name| !name.is_empty())
                 .cloned()
@@ -3823,7 +3891,7 @@ fn building_element_from_input(
             u_value_input,
             areal_heat_capacity,
             mass_distribution_class,
-            orientation,
+            orientation360: orientation,
             base_height,
             ..
         } => {
@@ -3858,7 +3926,7 @@ fn building_element_from_input(
             area_input,
             u_value_input,
             pitch,
-            orientation,
+            orientation360: orientation,
             g_value,
             frame_area_fraction,
             base_height,
@@ -3866,31 +3934,30 @@ fn building_element_from_input(
             treatment,
             ..
         } => {
-            let BuildingElementHeightWidthInput { height, width } =
-                area_input.height_and_width.ok_or_else(|| {
-                    anyhow!("Height and width of transparent building element must be provided.")
-                })?;
+            let BuildingElementHeightWidthInput { height, width } = *area_input;
 
             BuildingElement::Transparent(BuildingElementTransparent::new(
                 *pitch,
                 init_resistance_or_uvalue_from_input_struct(u_value_input, *pitch)?,
-                *orientation,
+                Some(*orientation),
                 *g_value,
                 *frame_area_fraction,
                 *base_height,
                 height,
                 width,
                 Some(shading.clone()),
-                treatment
-                    .iter()
-                    .map(|t| {
-                        WindowTreatment::from_input(
-                            t,
-                            controls,
-                            simulation_time_iterator.current_hour(),
-                        )
-                    })
-                    .collect_vec(),
+                treatment.as_ref().map(|treatments| {
+                    treatments
+                        .iter()
+                        .map(|t| {
+                            WindowTreatment::from_input(
+                                t,
+                                controls,
+                                simulation_time_iterator.current_hour(),
+                            )
+                        })
+                        .collect_vec()
+                }),
                 external_conditions,
             ))
         }
@@ -3930,9 +3997,7 @@ fn building_element_from_input(
             ..
         } => {
             BuildingElement::AdjacentConditionedSpace(BuildingElementAdjacentConditionedSpace::new(
-                area.ok_or_else(|| {
-                    anyhow!("AdjacentConditionedSpace building element is expected have an area")
-                })?,
+                *area,
                 *pitch,
                 init_resistance_or_uvalue_from_input_struct(u_value_input, *pitch)?,
                 *areal_heat_capacity,
@@ -3949,9 +4014,7 @@ fn building_element_from_input(
             mass_distribution_class,
         } => BuildingElement::AdjacentUnconditionedSpaceSimple(
             BuildingElementAdjacentUnconditionedSpaceSimple::new(
-                area.ok_or_else(|| {
-                    anyhow!("AdjacentUnconditionedSpace building element is expected have an area")
-                })?,
+                *area,
                 *pitch,
                 init_resistance_or_uvalue_from_input_struct(u_value_input, *pitch)?,
                 *thermal_resistance_unconditioned_space,
@@ -3960,6 +4023,28 @@ fn building_element_from_input(
                 external_conditions,
             ),
         ),
+        BuildingElementInput::PartyWall {
+            area,
+            pitch,
+            u_value_input,
+            party_wall_cavity_data,
+            areal_heat_capacity,
+            mass_distribution_class,
+        } =>
+        // Handle party wall with automatic or manual cavity resistance
+        {
+            BuildingElement::PartyWall(BuildingElementPartyWall::new(
+                *area,
+                *pitch,
+                init_resistance_or_uvalue_from_input_struct(u_value_input, *pitch)?,
+                PartyWallCavityType::from(*party_wall_cavity_data),
+                party_wall_cavity_data.party_wall_lining_type(),
+                party_wall_cavity_data.thermal_resistance_cavity(),
+                *areal_heat_capacity,
+                *mass_distribution_class,
+                external_conditions,
+            )?)
+        }
     }))
 }
 
@@ -4014,9 +4099,8 @@ fn apply_appliance_gains_from_input(
         .sorted_by(|_, details1, _, details2| {
             details1.priority.expect(
                 "All details in the output from check_priority were expected to have a priority.",
-            ).cmp(&details2.priority.expect("All details in the output from check_priority were expected to have a priority."))
+            ).cmp(&details2.priority.expect("All details in the output from check_priority were expected to have a priority.")).reverse()
         })
-        .rev()
         .collect::<IndexMap<_, _>>();
 
     for (name, gains_details) in sorted_input {
@@ -4058,6 +4142,7 @@ fn apply_appliance_gains_from_input(
                 &gains_details,
                 energy_supply_conn,
                 total_floor_area,
+                simulation_time,
             )?)
         };
 
@@ -4071,6 +4156,7 @@ fn appliance_gains_from_single_input(
     input: &ApplianceGainsDetails,
     energy_supply_connection: EnergySupplyConnection,
     total_floor_area: f64,
+    simulation_time_iterator: &SimulationTimeIterator,
 ) -> anyhow::Result<ApplianceGains> {
     let total_energy_supply = reject_nulls(expand_numeric_schedule(
         input
@@ -4082,13 +4168,14 @@ fn appliance_gains_from_single_input(
     .map(|energy_data| energy_data / total_floor_area)
     .collect();
 
-    Ok(ApplianceGains::new(
+    ApplianceGains::new(
         total_energy_supply,
         input.gains_fraction,
         input.start_day,
         input.time_series_step,
+        simulation_time_iterator,
         energy_supply_connection,
-    ))
+    )
 }
 
 #[derive(Debug)]
@@ -4125,9 +4212,12 @@ impl HeatSource {
                     .lock()
                     .demand_energy(energy_demand, simulation_time_iteration.index)),
             },
-            HeatSource::Wet(ref mut wet) => {
-                wet.demand_energy(energy_demand, None, temp_return, simulation_time_iteration)
-            }
+            HeatSource::Wet(ref mut wet) => wet.demand_energy(
+                energy_demand,
+                None,
+                temp_return.into(),
+                simulation_time_iteration,
+            ),
         }
     }
 
@@ -4165,7 +4255,7 @@ impl HeatBattery {
     pub(crate) fn timestep_end(&self, simtime: SimulationTimeIteration) -> anyhow::Result<()> {
         match self {
             HeatBattery::DryCore(heat_battery) => heat_battery.timestep_end(simtime)?,
-            HeatBattery::Pcm(heat_battery) => heat_battery.read().timestep_end(simtime.index)?,
+            HeatBattery::Pcm(heat_battery) => heat_battery.read().timestep_end(simtime)?,
         }
 
         Ok(())
@@ -4253,12 +4343,31 @@ impl WetHeatSource {
     }
 }
 
+// TODO - this enum is a placeholder, to review later and potentially implement a trait instead
+#[derive(Debug)]
+pub(crate) enum HeatSystem {
+    WetSystem(WetHeatSource),
+    WwhrsSystem(Arc<Mutex<WwhrsInstantaneous>>),
+}
+
+impl HeatSystem {
+    pub(crate) fn timestep_end(&self, simtime: SimulationTimeIteration) -> anyhow::Result<()> {
+        match self {
+            HeatSystem::WetSystem(wet_heat_source) => wet_heat_source.timestep_end(simtime),
+            HeatSystem::WwhrsSystem(wwhrs) => {
+                wwhrs.lock().timestep_end();
+                Ok(())
+            }
+        }
+    }
+}
+
 pub type ResultsPerTimestep =
     IndexMap<Arc<str>, IndexMap<(Arc<str>, Option<Arc<str>>), Vec<ResultParamValue>>>;
 pub type ResultsAnnual =
     IndexMap<Arc<str>, IndexMap<(Arc<str>, Option<Arc<str>>), ResultParamValue>>;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub enum ResultParamValue {
     String(String),
     Number(f64),
@@ -4370,6 +4479,38 @@ impl From<StringOrNumber> for ResultParamValue {
     }
 }
 
+impl From<&StringOrNumber> for ResultParamValue {
+    fn from(value: &StringOrNumber) -> Self {
+        match value {
+            StringOrNumber::String(string) => Self::String(string.to_owned()),
+            StringOrNumber::Float(number) => Self::Number(*number),
+            StringOrNumber::Integer(number) => Self::Number(*number as f64),
+        }
+    }
+}
+
+impl From<ResultParamValue> for StringOrNumber {
+    fn from(value: ResultParamValue) -> Self {
+        match value {
+            ResultParamValue::String(string) => Self::String(string),
+            ResultParamValue::Number(number) => Self::Float(number),
+            ResultParamValue::Boolean(bool) => Self::String(String::from(bool.to_string())),
+            ResultParamValue::Empty => Self::String(String::default()),
+        }
+    }
+}
+
+impl From<&ResultParamValue> for StringOrNumber {
+    fn from(value: &ResultParamValue) -> Self {
+        match value {
+            ResultParamValue::String(string) => Self::String(string.to_owned()),
+            ResultParamValue::Number(number) => Self::Float(*number),
+            ResultParamValue::Boolean(bool) => Self::String(String::from(bool.to_string())),
+            ResultParamValue::Empty => Self::String(String::default()),
+        }
+    }
+}
+
 impl<T: Into<ResultParamValue>> From<Option<T>> for ResultParamValue {
     fn from(value: Option<T>) -> Self {
         match value {
@@ -4408,8 +4549,14 @@ impl Serialize for ResultParamValue {
     }
 }
 
+struct HeatSourceWetDataFromInput {
+    heat_source: WetHeatSource,
+    internal_gains_from_heat_source_wet: Vec<(Arc<str>, InternalGains)>,
+    timestep_end_calcs_from_heat_sources: Vec<WetHeatSource>,
+}
+
 fn heat_source_wet_from_input(
-    energy_supply_name: &str,
+    name: &str,
     input: HeatSourceWetDetails,
     external_conditions: Arc<ExternalConditions>,
     simulation_time: Arc<SimulationTimeIterator>,
@@ -4418,9 +4565,13 @@ fn heat_source_wet_from_input(
     temp_internal_air_fn: TempInternalAirFn,
     controls: &Controls,
     energy_supplies: &mut IndexMap<String, Arc<RwLock<EnergySupply>>>,
+    total_floor_area: f64,
+    existing_internal_gains_names: &[Arc<str>],
     detailed_output_heating_cooling: bool,
-) -> anyhow::Result<WetHeatSource> {
-    match &input {
+) -> anyhow::Result<HeatSourceWetDataFromInput> {
+    let mut internal_gains_from_heat_source_wet = vec![];
+    let mut timestep_end_calcs = vec![];
+    let wet_heat_source = match &input {
         HeatSourceWetDetails::HeatPump {
             source_type,
             energy_supply_heat_network,
@@ -4483,18 +4634,20 @@ fn heat_source_wet_from_input(
                     .clone();
                 let energy_supply_conn_aux_boiler = EnergySupply::connection(
                     energy_supply_aux_boiler,
-                    format!("Boiler_auxiliary: {energy_supply_name}").as_str(),
+                    format!("Boiler_auxiliary: {name}").as_str(),
                 )?;
 
                 let cost_schedule_hybrid_hp = boiler.cost_schedule_hybrid.clone();
 
-                let boiler = Boiler::new(
+                let boiler = Arc::new(RwLock::new(Boiler::new(
                     boiler.as_ref().into(),
                     energy_supply_boiler,
                     energy_supply_conn_aux_boiler,
                     external_conditions.clone(),
                     simulation_time.step_in_hours(),
-                )?;
+                )?));
+
+                timestep_end_calcs.push(WetHeatSource::Boiler(boiler.clone()));
 
                 (Some(boiler), cost_schedule_hybrid_hp)
             } else {
@@ -4507,25 +4660,27 @@ fn heat_source_wet_from_input(
                     anyhow!("Heat pump references an undeclared energy supply '{energy_supply}'.")
                 })?
                 .clone();
-            let energy_supply_conn_name_auxiliary =
-                format!("HeatPump_auxiliary: {energy_supply_name}");
+            let energy_supply_conn_name_auxiliary = format!("HeatPump_auxiliary: {name}");
 
-            Ok(WetHeatSource::HeatPump(Arc::new(Mutex::new(
-                HeatPump::new(
-                    &input,
-                    energy_supply,
-                    &energy_supply_conn_name_auxiliary,
-                    simulation_time.step_in_hours(),
-                    external_conditions.clone(),
-                    number_of_zones,
-                    throughput_exhaust_air,
-                    energy_supply_heat_source,
-                    detailed_output_heating_cooling,
-                    boiler.map(|boiler: Boiler| Arc::new(RwLock::new(boiler))),
-                    cost_schedule_hybrid_hp,
-                    temp_internal_air_fn,
-                )?,
-            ))))
+            let heat_source = WetHeatSource::HeatPump(Arc::new(Mutex::new(HeatPump::new(
+                &input,
+                energy_supply,
+                &energy_supply_conn_name_auxiliary,
+                simulation_time.step_in_hours(),
+                external_conditions.clone(),
+                number_of_zones,
+                throughput_exhaust_air,
+                energy_supply_heat_source,
+                detailed_output_heating_cooling,
+                boiler,
+                cost_schedule_hybrid_hp,
+                temp_internal_air_fn,
+                simulation_time.as_ref(),
+            )?)));
+
+            timestep_end_calcs.push(heat_source.clone());
+
+            heat_source
         }
         HeatSourceWetDetails::Boiler {
             energy_supply,
@@ -4539,11 +4694,11 @@ fn heat_source_wet_from_input(
                 })?
                 .clone();
             let energy_supply_aux = energy_supplies.get(energy_supply_auxiliary).ok_or_else(|| anyhow!("Boiler references undeclared auxiliary energy supply '{energy_supply_auxiliary}'."))?.clone();
-            let aux_supply_name = format!("Boiler_auxiliary: {energy_supply_name}");
+            let aux_supply_name = format!("Boiler_auxiliary: {name}");
             let energy_supply_conn_aux =
                 EnergySupply::connection(energy_supply_aux.clone(), aux_supply_name.as_str())?;
 
-            Ok(WetHeatSource::Boiler(Arc::new(RwLock::new(
+            let heat_source = WetHeatSource::Boiler(Arc::new(RwLock::new(
                 Boiler::new(
                     input,
                     energy_supply,
@@ -4552,7 +4707,11 @@ fn heat_source_wet_from_input(
                     simulation_time.step_in_hours(),
                 )
                 .expect("could not construct boiler value from provided data"),
-            ))))
+            )));
+
+            timestep_end_calcs.push(heat_source.clone());
+
+            heat_source
         }
         HeatSourceWetDetails::Hiu {
             power_max,
@@ -4570,16 +4729,11 @@ fn heat_source_wet_from_input(
                 })?
                 .clone();
             let energy_supply_conn_name_auxiliary =
-                String::from(["HeatNetwork_auxiliary: ", energy_supply_name].concat());
-            let energy_supply_conn_name_building_level_distribution_losses = String::from(
-                [
-                    "HeatNetwork_building_level_distribution_losses: ",
-                    energy_supply_name,
-                ]
-                .concat(),
-            );
+                String::from(["HeatNetwork_auxiliary: ", name].concat());
+            let energy_supply_conn_name_building_level_distribution_losses =
+                String::from(["HeatNetwork_building_level_distribution_losses: ", name].concat());
 
-            Ok(WetHeatSource::Hiu(Arc::new(Mutex::new(HeatNetwork::new(
+            let heat_network = HeatNetwork::new(
                 *power_max,
                 *hiu_daily_loss,
                 power_circ_pump.unwrap_or(0.06),
@@ -4589,26 +4743,51 @@ fn heat_source_wet_from_input(
                 energy_supply_conn_name_auxiliary,
                 energy_supply_conn_name_building_level_distribution_losses,
                 simulation_time.step_in_hours(),
-            )))))
+            );
+            let heat_network_hiu_loss = heat_network.hiu_loss();
+
+            let heat_source = WetHeatSource::Hiu(Arc::new(Mutex::new(heat_network)));
+
+            timestep_end_calcs.push(heat_source.clone());
+
+            // Create list of internal gains for each hour of the year, in W / m²
+            let internal_gains_hiu =
+                heat_network_hiu_loss * WATTS_PER_KILOWATT as f64 / total_floor_area;
+            let total_internal_gains_hiu =
+                vec![internal_gains_hiu; DAYS_PER_YEAR as usize * HOURS_PER_DAY as usize];
+
+            if existing_internal_gains_names
+                .iter()
+                .map(AsRef::as_ref)
+                .any(|existing_name| name == existing_name)
+            {
+                bail!("Name '{name}' of HIU duplicates name of an existing InternalGains object");
+            }
+
+            internal_gains_from_heat_source_wet.push((
+                <Arc<str>>::from(name),
+                InternalGains::new(total_internal_gains_hiu, 0, 1.0, simulation_time.as_ref())?,
+            ));
+
+            heat_source
         }
-        HeatSourceWetDetails::HeatBattery { battery } => match battery {
-            HeatBatteryInput::Pcm {
-                control_charge,
-                energy_supply,
-                ..
-            } => {
-                let energy_supply = energy_supplies
-                    .get(energy_supply)
-                    .ok_or_else(|| {
-                        anyhow!(
+        HeatSourceWetDetails::HeatBattery { battery } => {
+            let heat_source = match battery {
+                HeatBatteryInput::Pcm {
+                    control_charge,
+                    energy_supply,
+                    ..
+                } => {
+                    let energy_supply = energy_supplies
+                        .get(energy_supply)
+                        .ok_or_else(|| {
+                            anyhow!(
                         "Heat battery references an undeclared energy supply '{energy_supply}'."
                     )
-                    })?
-                    .clone();
-                let energy_supply_conn =
-                    EnergySupply::connection(energy_supply.clone(), energy_supply_name)?;
+                        })?
+                        .clone();
+                    let energy_supply_conn = EnergySupply::connection(energy_supply.clone(), name)?;
 
-                let heat_source =
                     WetHeatSource::HeatBattery(HeatBattery::Pcm(Arc::new(RwLock::new(HeatBatteryPcm::new(
                         &input,
                         controls
@@ -4621,51 +4800,60 @@ fn heat_source_wet_from_input(
                             .clone(),
                         energy_supply,
                         energy_supply_conn,
-                        simulation_time,
+                        simulation_time.step_in_hours(),
                         None,
                         None,
                         None,
                         None,
                         Some(detailed_output_heating_cooling),
-                    )))));
-                Ok(heat_source)
-            }
-            HeatBatteryInput::DryCore {
-                control_charge,
-                energy_supply,
-                number_of_units,
-                ..
-            } => {
-                let energy_supply = energy_supplies
-                    .get(energy_supply)
-                    .ok_or_else(|| {
-                        anyhow!(
+                    )))))
+                }
+                HeatBatteryInput::DryCore {
+                    control_charge,
+                    energy_supply,
+                    number_of_units,
+                    ..
+                } => {
+                    let energy_supply = energy_supplies
+                        .get(energy_supply)
+                        .ok_or_else(|| {
+                            anyhow!(
                         "Heat battery references an undeclared energy supply '{energy_supply}'."
                     )
-                    })?
-                    .clone();
-                let energy_supply_conn =
-                    EnergySupply::connection(energy_supply.clone(), energy_supply_name)?;
+                        })?
+                        .clone();
+                    let energy_supply_conn = EnergySupply::connection(energy_supply.clone(), name)?;
 
-                Ok(WetHeatSource::HeatBattery(HeatBattery::DryCore(HeatBatteryDryCore::new(
-                    battery,
-                    controls
-                        .get_with_string(control_charge)
-                        .unwrap_or_else(|| {
-                            panic!(
-                                "expected a control to be registered with the name '{control_charge}'"
-                            )
-                        })
-                        .clone(),
-                    energy_supply,
-                    energy_supply_conn,
-                    Some(*number_of_units as u32),
-                    simulation_time.step_in_hours(),
-                    detailed_output_heating_cooling.into(),
-                )?)))
-            }
-        },
-    }
+                    WetHeatSource::HeatBattery(HeatBattery::DryCore(HeatBatteryDryCore::new(
+                        battery,
+                        controls
+                            .get_with_string(control_charge)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "expected a control to be registered with the name '{control_charge}'"
+                                )
+                            })
+                            .clone(),
+                        energy_supply,
+                        energy_supply_conn,
+                        Some(*number_of_units as u32),
+                        simulation_time.step_in_hours(),
+                        detailed_output_heating_cooling.into(),
+                    )?))
+                }
+            };
+
+            timestep_end_calcs.push(heat_source.clone());
+
+            heat_source
+        }
+    };
+
+    Ok(HeatSourceWetDataFromInput {
+        heat_source: wet_heat_source,
+        internal_gains_from_heat_source_wet,
+        timestep_end_calcs_from_heat_sources: timestep_end_calcs,
+    })
 }
 
 struct HeatSourceFromInput {
@@ -4732,7 +4920,7 @@ fn heat_source_from_input(
             power_pump,
             power_pump_control,
             tilt,
-            orientation,
+            orientation360: orientation,
             solar_loop_piping_hlc,
             energy_supply,
             control_max,
@@ -4894,8 +5082,8 @@ fn heat_source_from_input(
                         *vol_hw_daily_average,
                         volume,
                         daily_losses,
-                        heat_exchanger_surface_area.ok_or(anyhow!("A heat exchanger surface_area is expected for a HeatPumpHotWaterOnly heat source")) ?,
-                        * in_use_factor_mismatch,
+                        heat_exchanger_surface_area.ok_or(anyhow!("A heat exchanger surface_area is expected for a HeatPumpHotWaterOnly heat source"))?,
+                        *in_use_factor_mismatch,
                         *tank_volume_declared,
                         *heat_exchanger_surface_area_declared,
                         *daily_losses_declared,
@@ -4911,16 +5099,19 @@ fn heat_source_from_input(
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum HotWaterSource {
+#[derive(Clone, Debug)]
+pub enum HotWaterSource {
     PreHeated(HotWaterStorageTank),
     CombiBoiler(Arc<BoilerServiceWaterCombi>),
     PointOfUse(Arc<PointOfUse>),
     HeatNetwork(Arc<HeatNetworkServiceWaterDirect>),
     HeatBattery(HeatBatteryHotWaterSource),
+    Fake(Arc<dyn HotWaterSourceBehaviour>),
+    #[cfg(test)]
+    Mock(HotWaterSourceMockKind),
 }
 
-pub(crate) trait HotWaterSourceBehaviour: std::fmt::Debug + Clone {
+pub trait HotWaterSourceBehaviour: std::fmt::Debug {
     fn get_cold_water_source(&self) -> WaterSupply;
     fn demand_hot_water(
         &self,
@@ -4947,11 +5138,14 @@ pub(crate) trait HotWaterSourceBehaviour: std::fmt::Debug + Clone {
 impl HotWaterSourceBehaviour for HotWaterSource {
     fn get_cold_water_source(&self) -> WaterSupply {
         match self {
-            HotWaterSource::PreHeated(source) => source.get_cold_water_source(),
+            HotWaterSource::PreHeated(source) => source.ultimate_cold_water_source(),
             HotWaterSource::CombiBoiler(source) => source.get_cold_water_source().clone(),
             HotWaterSource::PointOfUse(source) => source.get_cold_water_source().clone(),
             HotWaterSource::HeatNetwork(source) => source.get_cold_water_source().clone(),
             HotWaterSource::HeatBattery(source) => source.get_cold_water_source().clone(),
+            HotWaterSource::Fake(source) => source.get_cold_water_source().clone(),
+            #[cfg(test)]
+            HotWaterSource::Mock(source) => source.get_cold_water_source(),
         }
     }
 
@@ -4976,6 +5170,9 @@ impl HotWaterSourceBehaviour for HotWaterSource {
             HotWaterSource::HeatBattery(heat_battery_hot_water_source) => {
                 heat_battery_hot_water_source.demand_hot_water(usage_events, simtime)?
             }
+            HotWaterSource::Fake(source) => source.demand_hot_water(usage_events, simtime)?,
+            #[cfg(test)]
+            HotWaterSource::Mock(source) => source.demand_hot_water(usage_events, simtime)?,
         })
     }
 
@@ -5006,6 +5203,13 @@ impl HotWaterSourceBehaviour for HotWaterSource {
                     simtime,
                 )
             }
+            HotWaterSource::Fake(source) => {
+                source.get_temp_hot_water(volume_required, volume_required_already, simtime)
+            }
+            #[cfg(test)]
+            HotWaterSource::Mock(source) => {
+                source.get_temp_hot_water(volume_required, volume_required_already, simtime)
+            }
         }
     }
 
@@ -5021,6 +5225,9 @@ impl HotWaterSourceBehaviour for HotWaterSource {
             HotWaterSource::PointOfUse(_) => None,
             HotWaterSource::HeatNetwork(_) => None,
             HotWaterSource::HeatBattery(_) => None,
+            HotWaterSource::Fake(source) => source.internal_gains(),
+            #[cfg(test)]
+            HotWaterSource::Mock(source) => source.internal_gains(),
         }
     }
 
@@ -5030,6 +5237,8 @@ impl HotWaterSourceBehaviour for HotWaterSource {
             HotWaterSource::PreHeated(hot_water_storage_tank) => {
                 hot_water_storage_tank.get_losses_from_primary_pipework_and_storage()
             }
+            #[cfg(test)]
+            HotWaterSource::Mock(source) => source.get_losses_from_primary_pipework_and_storage(),
             _ => (0., 0.),
         }
     }
@@ -5040,8 +5249,8 @@ impl HotWaterSourceBehaviour for HotWaterSource {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum HeatBatteryHotWaterSource {
-    Pcm(Arc<HeatBatteryPcmServiceWaterDirect>),
+pub enum HeatBatteryHotWaterSource {
+    Pcm(Arc<HeatBatteryPcmServiceWaterDirect<WaterSupply>>),
     DryCore(Arc<HeatBatteryDryCoreServiceWaterDirect<WaterSupply>>),
 }
 
@@ -5104,8 +5313,8 @@ fn hot_water_source_from_input(
     simulation_time: &SimulationTimeIterator,
     external_conditions: Arc<ExternalConditions>,
     detailed_output_heating_cooling: bool,
-    used_heat_source_names: &mut HashSet<String>,
-    cold_water_sources_already_allocated: &mut HashSet<String>,
+    used_heat_source_names: &mut IndexSet<String>,
+    cold_water_sources_already_allocated: &mut IndexSet<String>,
 ) -> anyhow::Result<(HotWaterSource, Vec<String>, IndexMap<String, String>)> {
     let mut energy_supply_conn_names = vec![];
     let mut hot_water_source_name_for_service: IndexMap<String, String> = Default::default();
@@ -5113,7 +5322,7 @@ fn hot_water_source_from_input(
 
     let cold_water_source_for_hot_water_tank =
         |cold_water_source_type: &str,
-         cold_water_sources_already_allocated: &mut HashSet<String>|
+         cold_water_sources_already_allocated: &mut IndexSet<String>|
          -> anyhow::Result<WaterSupply> {
             cold_water_sources.get(cold_water_source_type).map(|source| Ok(WaterSupply::ColdWaterSource(source.clone()))).or_else(|| {
                 let source = pre_heated_water_sources
@@ -5229,7 +5438,16 @@ fn hot_water_source_from_input(
      -> anyhow::Result<()> {
         for (heat_source_name, hs) in heat_source {
             let heat_source_name = String::from(heat_source_name);
-            let energy_supply_name = hs.energy_supply_name();
+            // HeatSourceWet types do not have their own EnergySupply
+            // — the energy supply is on the parent HeatSourceWet object.
+            // PV diverters only connect to non-wet heat sources (e.g.
+            // immersion heaters), so skip the diverter check.
+            let energy_supply_name = if let Some(energy_supply_name) = hs.energy_supply_name() {
+                energy_supply_name
+            } else {
+                // it was a HeatSourceWet type - anything else would have returned its energy supply name
+                continue;
+            };
             if let Some(diverter) = diverter_types.get(energy_supply_name) {
                 if diverter.heat_source.matches(&heat_source_name) {
                     let energy_supply = energy_supplies.get(energy_supply_name).ok_or_else(|| anyhow!("Heat source references an undeclared energy supply '{energy_supply_name}'."))?.clone();
@@ -5292,7 +5510,7 @@ fn hot_water_source_from_input(
                 *daily_losses,
                 *init_temp,
                 cold_water_source,
-                simulation_time.step_in_hours(),
+                &simulation_time.current_iteration(),
                 heat_sources.clone(),
                 temp_internal_air_fn,
                 external_conditions,
@@ -5368,7 +5586,7 @@ fn hot_water_source_from_input(
                 *temp_usable,
                 controls.get_with_string(temp_setpnt_max).ok_or_else(|| anyhow!("A control indicated by `temp_setpnt_max` is needed for a SmartHotWaterTank object."))?,
                 cold_water_source.clone(),
-                simulation_time.step_in_hours(),
+                &simulation_time.current_iteration(),
                 heat_sources.clone(),
                 temp_internal_air_fn,
                 external_conditions,
@@ -5637,7 +5855,7 @@ fn space_heat_systems_from_input(
                                         emitter_type,
                                         temp_flow_limit_upper.expect("Expected a temp_flow_limit_upper to be present for a heat pump"),
                                         *temp_diff_emit_dsgn,
-                                        *design_flow_temp as f64,
+                                        *design_flow_temp,
                                         control,
                                         volume_heated);
 
@@ -5645,7 +5863,7 @@ fn space_heat_systems_from_input(
                                         // Record heating system as potentially requiring overventilation
                                         heat_system_names_requiring_overvent.push((system_name).clone());
                                     }
-                                    SpaceHeatingService::HeatPump(heat_source_service)
+                                    SpaceHeatingService::HeatPump(heat_source_service?)
                                 }
                                 WetHeatSource::Boiler(boiler) => {
                                     let heat_source_service = Boiler::create_service_space_heating(boiler.clone(), &energy_supply_conn_name, control);
@@ -5670,7 +5888,6 @@ fn space_heat_systems_from_input(
                             let energy_supply_name = energy_supply.clone().unwrap();
                             let energy_supply = energy_supplies.get(&energy_supply_name).ok_or_else(|| anyhow!("Space heat system references an undeclared energy supply '{energy_supply_name}'."))?.clone();
                             let energy_supply_fc_conn_name: Arc<str> = format!("FC_fan {system_name}").into();
-                            energy_conn_names_for_systems.insert(system_name.clone(), energy_supply_fc_conn_name.clone());
                             Some(Arc::new(EnergySupply::connection(energy_supply, energy_supply_fc_conn_name.as_ref()).unwrap()))
                         };
 
@@ -5701,14 +5918,14 @@ fn space_heat_systems_from_input(
                             // zone area
                             external_conditions.clone(),
                             *ecodesign_controller,
-                            *design_flow_temp as f64,
+                            *design_flow_temp,
                             initial_temp,
                             simulation_time.total_steps(),
                             energy_supply_fc_conn,
                             detailed_output_heating_cooling.into(),
                             with_buffer_tank.into(),
                         )?;
-                        SpaceHeatSystem::WetDistribution(space_heater)
+                        SpaceHeatSystem::WetDistribution(space_heater.into())
                     }
                     SpaceHeatSystemDetails::WarmAir {
                         frac_convective,
@@ -5815,7 +6032,7 @@ fn on_site_generation_from_input(
                         peak_power,
                         ventilation_strategy,
                         pitch,
-                        orientation,
+                                                            orientation360: orientation,
                         base_height,
                         height,
                         width,
@@ -5845,7 +6062,7 @@ fn on_site_generation_from_input(
                                     panel.peak_power,
                                     panel.ventilation_strategy,
                                     panel.pitch,
-                                    panel.orientation,
+                                    panel.orientation360,
                                     panel.base_height,
                                     panel.height,
                                     panel.width,
@@ -5866,7 +6083,7 @@ fn on_site_generation_from_input(
                 let energy_supply_conn = EnergySupply::connection(energy_supply, name).unwrap();
                 let inverter = Inverter::new(
                     energy_supply_conn,
-                    simulation_time_iterator.clone(),
+                    simulation_time_iterator.step_in_hours(),
                     inverter_peak_power_dc,
                     inverter_peak_power_ac,
                     inverter_is_inside,
@@ -5887,19 +6104,17 @@ fn total_volume_heated_by_system(
     heat_system_name_for_zone: &IndexMap<Arc<str>, Vec<Arc<str>>>,
     heat_system_name: &str,
 ) -> f64 {
-    zones
-        .iter()
-        .filter_map(|(z_name, zone)| {
-            if let Some(system_names) = heat_system_name_for_zone.get(z_name) {
-                (system_names
-                    .iter()
-                    .any(|name| heat_system_name == name.as_ref()))
-                .then(|| zone.volume())
-            } else {
-                None
-            }
-        })
-        .sum::<f64>()
+    FSum::with_all(zones.iter().filter_map(|(z_name, zone)| {
+        if let Some(system_names) = heat_system_name_for_zone.get(z_name) {
+            (system_names
+                .iter()
+                .any(|name| heat_system_name == name.as_ref()))
+            .then(|| zone.volume())
+        } else {
+            None
+        }
+    }))
+    .value()
 }
 
 fn required_vent_data_from_input(input: &ControlInput) -> anyhow::Result<Option<RequiredVentData>> {
@@ -5921,4 +6136,245 @@ struct RequiredVentData {
     schedule: Vec<Option<f64>>,
     start_day: u32,
     time_series_step: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::corpus::{Corpus, OutputOptions};
+    use crate::input::{HotWaterSourceDetails, Input};
+    use rstest::{fixture, rstest};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[fixture]
+    fn minimal_input() -> Input {
+        const NUM_TIMESTEPS: usize = 8;
+        let air_temperatures = [10.; NUM_TIMESTEPS];
+        let wind_speeds = [4.; NUM_TIMESTEPS];
+        let wind_directions = [180.; NUM_TIMESTEPS];
+        let diffuse_horizontal_radiation = [100.; NUM_TIMESTEPS];
+        let direct_beam_radiation = [200.; NUM_TIMESTEPS];
+        let solar_reflectivity_of_ground = [0.2; NUM_TIMESTEPS];
+        let schedule_main = [0.; NUM_TIMESTEPS];
+        let temperatures = [10.; NUM_TIMESTEPS];
+
+        serde_json::from_value(json!({
+            "temp_internal_air_static_calcs": 20.0,
+            "SimulationTime": {
+                "start": 0,
+                "end": NUM_TIMESTEPS,
+                "step": 1,
+            },
+            "ExternalConditions": {
+                "air_temperatures": air_temperatures,
+                "wind_speeds": wind_speeds,
+                "wind_directions": wind_directions,
+                "diffuse_horizontal_radiation": diffuse_horizontal_radiation,
+                "direct_beam_radiation": direct_beam_radiation,
+                "solar_reflectivity_of_ground": solar_reflectivity_of_ground,
+                "latitude": 51.5,
+                "longitude": -0.1,
+                "direct_beam_conversion_needed": false,
+                "shading_segments": [
+                    {"start360": 0, "end360": 360},
+                ],
+            },
+            "InternalGains": {
+                "total_internal_gains": {
+                    "start_day": 0,
+                    "time_series_step": 1,
+                    "schedule": {
+                        "main": schedule_main,
+                    },
+                }
+            },
+            "ApplianceGains": {},
+            "Zone": {
+                "zone1": {
+                    "area": 50.0,
+                    "volume": 100.0,
+                    "temp_setpnt_init": 21.0,
+                    "BuildingElement": {
+                        "wall1": {
+                            "type": "BuildingElementOpaque",
+                            "width": 5.0,
+                            "height": 2.5,
+                            "area": 12.5,
+                            "base_height": 0,
+                            "orientation360": 0,
+                            "pitch": 90,
+                            "solar_absorption_coeff": 0.6,
+                            "u_value": 0.18,
+                            "areal_heat_capacity": 110000,
+                            "mass_distribution_class": "IE",
+                        }
+                    },
+                    "ThermalBridging": {},
+                }
+            },
+            "ColdWaterSource": {
+                "mains water": {
+                    "start_day": 0,
+                    "time_series_step": 1,
+                    "temperatures": temperatures,
+                }
+            },
+            "EnergySupply": {
+                "mains elec": {
+                    "fuel": "electricity",
+                    "is_export_capable": false,
+                }
+            },
+            "Control": {
+                "min_temp": {
+                    "type": "SetpointTimeControl",
+                    "start_day": 0,
+                    "time_series_step": 1,
+                    "schedule": {
+                        "main": [
+                            {
+                                "value": 50.0,
+                                "repeat": NUM_TIMESTEPS,
+                            }
+                        ]
+                    },
+                },
+                "setpoint_temp_max": {
+                    "type": "SetpointTimeControl",
+                    "start_day": 0,
+                    "time_series_step": 1,
+                    "schedule": {
+                        "main": [
+                            {
+                                "value": 60.0,
+                                "repeat": NUM_TIMESTEPS,
+                            }
+                        ]
+                    },
+                },
+            },
+            "Events": {
+                "Shower": {},
+                "Bath": {},
+                "Other": {},
+            },
+            "InfiltrationVentilation": {
+                "cross_vent_possible": false,
+                "shield_class": "Normal",
+                "terrain_class": "OpenField",
+                "ventilation_zone_base_height": 2.5,
+                "altitude": 30,
+                "Vents": {},
+                "Leaks": {
+                    "ventilation_zone_height": 6,
+                    "test_pressure": 50,
+                    "test_result": 1.2,
+                    "env_area": 220,
+                },
+            },
+            "HotWaterDemand": {
+                "Shower": {},
+                "Bath": {},
+                "Other": {},
+                "Distribution": {},
+            },
+            "HotWaterSource": {},
+            "WWHRS": {},
+        }))
+        .unwrap()
+    }
+
+    fn create_preheated_water_source_storage_tank(
+        name: &str,
+        cold_water_source_name: &str,
+    ) -> HotWaterSourceDetails {
+        serde_json::from_value(json!(
+        {"type": "StorageTank",
+        "volume": 24.0,
+        "daily_losses": 1.55,
+        "init_temp": 48.0,
+        "ColdWaterSource": cold_water_source_name,
+        "HeatSource": {
+            format!("{name}_immersion"): {
+                "type": "ImmersionHeater",
+                "power": 3.0,
+                "EnergySupply": "mains elec",
+                "Controlmin": "min_temp",
+                "Controlmax": "setpoint_temp_max",
+                "heater_position": 0.3,
+                "thermostat_position": 0.33}}
+            }))
+        .unwrap()
+    }
+
+    /// Test that PreHeatedWaterSource objects can be initialized in any order
+    #[rstest]
+    fn test_preheated_water_source_initialization_order_independent(mut minimal_input: Input) {
+        let tank1 = create_preheated_water_source_storage_tank("tank1", "tank2");
+        let tank2 = create_preheated_water_source_storage_tank("tank2", "mains water");
+
+        minimal_input.pre_heated_water_source =
+            serde_json::from_value(json!({"tank1": tank1, "tank2": tank2})).unwrap();
+
+        let corpus = Corpus::from_inputs(
+            Arc::new(minimal_input),
+            None,
+            None,
+            &OutputOptions::default(),
+        )
+        .unwrap();
+
+        let pre_heated_sources = corpus.pre_heated_water_sources;
+
+        assert!(pre_heated_sources.contains_key("tank1"));
+        assert!(pre_heated_sources.contains_key("tank2"));
+    }
+
+    ///  Test that circular references between `PreHeatedWaterSource` objects are detected and raise an appropriate error.
+    #[rstest]
+    fn test_preheated_water_source_circular_reference_detection(mut minimal_input: Input) {
+        let tank1 = create_preheated_water_source_storage_tank("tank1", "tank2");
+        let tank2 = create_preheated_water_source_storage_tank("tank2", "tank1");
+
+        minimal_input.pre_heated_water_source =
+            serde_json::from_value(json!({"tank1": tank1, "tank2": tank2})).unwrap();
+
+        let result = Corpus::from_inputs(
+            Arc::new(minimal_input),
+            None,
+            None,
+            &OutputOptions::default(),
+        );
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "A circular dependency was found between defined preheated water sources."
+        )
+    }
+
+    /// Test that chains of dependencies work regardless of initialization order
+    #[rstest]
+    fn test_preheated_water_source_chain_of_dependencies(mut minimal_input: Input) {
+        let tank1 = create_preheated_water_source_storage_tank("tank1", "tank2");
+        let tank2 = create_preheated_water_source_storage_tank("tank2", "tank3");
+        let tank3 = create_preheated_water_source_storage_tank("tank3", "mains water");
+
+        minimal_input.pre_heated_water_source =
+            serde_json::from_value(json!({"tank1": tank1, "tank2": tank2, "tank3": tank3}))
+                .unwrap();
+
+        let corpus = Corpus::from_inputs(
+            Arc::new(minimal_input),
+            None,
+            None,
+            &OutputOptions::default(),
+        )
+        .unwrap();
+
+        let pre_heated_sources = corpus.pre_heated_water_sources;
+
+        assert!(pre_heated_sources.contains_key("tank1"));
+        assert!(pre_heated_sources.contains_key("tank2"));
+        assert!(pre_heated_sources.contains_key("tank3"));
+    }
 }

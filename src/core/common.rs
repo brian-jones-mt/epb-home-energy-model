@@ -7,7 +7,7 @@ use crate::simulation_time::SimulationTimeIteration;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-pub(crate) trait WaterSupplyBehaviour {
+pub trait WaterSupplyBehaviour: Clone {
     fn get_temp_cold_water(
         &self,
         volume_needed: f64,
@@ -19,10 +19,14 @@ pub(crate) trait WaterSupplyBehaviour {
         volume_needed: f64,
         simtime: SimulationTimeIteration,
     ) -> anyhow::Result<Vec<(f64, f64)>>;
+
+    fn ultimate_cold_water_source(&self) -> Self {
+        self.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum WaterSupply {
+pub enum WaterSupply {
     ColdWaterSource(Arc<ColdWaterSource>),
     Wwhrs(Arc<Mutex<WwhrsInstantaneous>>),
     Preheated(HotWaterStorageTank),
@@ -40,14 +44,16 @@ impl WaterSupplyBehaviour for WaterSupply {
             WaterSupply::ColdWaterSource(cold_water_source) => {
                 cold_water_source.get_temp_cold_water(volume_needed, simtime)
             }
-            WaterSupply::Wwhrs(wwhrs) => Ok(vec![wwhrs.lock().get_temp_cold_water(volume_needed)]),
+            WaterSupply::Wwhrs(wwhrs) => wwhrs.lock().get_temp_cold_water(volume_needed, simtime),
             WaterSupply::Preheated(storage_tank) => match storage_tank {
                 HotWaterStorageTank::StorageTank(rw_lock) => {
-                    Ok(rw_lock.read().get_temp_cold_water(volume_needed))
+                    rw_lock.read().get_temp_cold_water(volume_needed, simtime)
                 }
                 HotWaterStorageTank::SmartHotWaterTank(rw_lock) => {
-                    Ok(rw_lock.read().get_temp_cold_water(volume_needed))
+                    rw_lock.read().get_temp_cold_water(volume_needed, simtime)
                 }
+                #[cfg(test)]
+                HotWaterStorageTank::Mock(_source) => Ok(vec![]),
             },
             #[cfg(test)]
             WaterSupply::Mock(mock) => mock.get_temp_cold_water(volume_needed, simtime),
@@ -63,7 +69,7 @@ impl WaterSupplyBehaviour for WaterSupply {
             WaterSupply::ColdWaterSource(cold_water_source) => {
                 cold_water_source.draw_off_water(volume_needed, simtime)
             }
-            WaterSupply::Wwhrs(wwhrs) => Ok(vec![wwhrs.lock().draw_off_water(volume_needed)]),
+            WaterSupply::Wwhrs(wwhrs) => wwhrs.lock().draw_off_water(volume_needed, simtime),
             WaterSupply::Preheated(storage_tank) => match storage_tank {
                 HotWaterStorageTank::StorageTank(rw_lock) => {
                     rw_lock.read().draw_off_water(volume_needed, simtime)
@@ -71,16 +77,25 @@ impl WaterSupplyBehaviour for WaterSupply {
                 HotWaterStorageTank::SmartHotWaterTank(rw_lock) => {
                     rw_lock.read().draw_off_water(volume_needed, simtime)
                 }
+                #[cfg(test)]
+                HotWaterStorageTank::Mock(_source) => Ok(vec![]),
             },
             #[cfg(test)]
             WaterSupply::Mock(mock) => mock.draw_off_water(volume_needed, simtime),
         }
     }
+
+    fn ultimate_cold_water_source(&self) -> Self {
+        match self {
+            WaterSupply::Preheated(tank) => tank.ultimate_cold_water_source(),
+            _ => self.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MockWaterSupply {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MockWaterSupply {
     temperature: f64,
 }
 
@@ -107,5 +122,12 @@ impl WaterSupplyBehaviour for MockWaterSupply {
         simtime: SimulationTimeIteration,
     ) -> anyhow::Result<Vec<(f64, f64)>> {
         self.get_temp_cold_water(volume_needed, simtime)
+    }
+}
+
+#[cfg(test)]
+impl Default for MockWaterSupply {
+    fn default() -> Self {
+        Self { temperature: 10. }
     }
 }
